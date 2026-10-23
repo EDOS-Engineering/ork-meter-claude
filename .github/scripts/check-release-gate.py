@@ -11,8 +11,9 @@ def validate(environment, branches):
     review = next((r for r in rules if r.get("type") == "required_reviewers"), {})
     if not review.get("reviewers"):
         raise ValueError("production must require reviewers")
-    if review.get("prevent_self_review") is not True:
-        raise ValueError("production must prevent self-review")
+    # Self-review is allowed: the release engineer who dispatches a run may
+    # also approve it (the same posture as ork-meter-codex). Reviewers,
+    # no admin bypass and main-only deployment are still required.
     if environment.get("can_admins_bypass") is not False:
         raise ValueError("production must disable administrator bypass")
     policy = environment.get("deployment_branch_policy") or {}
