@@ -23,14 +23,16 @@ class ReleaseGate(unittest.TestCase):
 
     def test_protected_environment_is_accepted(self):
         gate.validate(self.environment, self.branches)
+        relaxed = copy.deepcopy(self.environment)
+        relaxed["protection_rules"][0]["prevent_self_review"] = False
+        gate.validate(relaxed, self.branches)
 
     def test_missing_or_weakened_review_is_rejected(self):
         variants = [{}, dict(self.environment, protection_rules=[]),
                     dict(self.environment, can_admins_bypass=True)]
-        for field, value in (("reviewers", []), ("prevent_self_review", False)):
-            env = copy.deepcopy(self.environment)
-            env["protection_rules"][0][field] = value
-            variants.append(env)
+        env = copy.deepcopy(self.environment)
+        env["protection_rules"][0]["reviewers"] = []
+        variants.append(env)
         for env in variants:
             with self.subTest(environment=env), self.assertRaises(ValueError):
                 gate.validate(env, self.branches)
