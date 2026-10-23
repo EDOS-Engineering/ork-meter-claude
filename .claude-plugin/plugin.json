@@ -1,7 +1,7 @@
 {
   "name": "ork-meter",
   "displayName": "Ork Meter for Claude Code",
-  "version": "0.5.4-dev",
+  "version": "0.5.4",
   "description": "Connect once to Ork Meter, then capture token-counter metadata automatically in normal Claude Code sessions. Browser pairing, secure credential storage, receiving status and reversible disconnect. With Ork Meter Plus (trial included) on a connected account, also trims tokens locally: oversized tool output, repeated reads, whole-file reads of huge files and passing-test noise are cut before they enter the context, with the full output kept on disk; a cache-miss nudge; a loop guard; a local savings ledger that labels estimates as estimates.",
   "author": {
     "name": "EDOS",
