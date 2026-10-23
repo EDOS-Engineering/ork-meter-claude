@@ -1,0 +1,397 @@
+name: ci
+
+# The plugin's CI gate (#6). `ci-gate` is the one check to require in the
+# `protecc-main` ruleset; it passes only if every job below passed.
+#
+# No run on push to main (#140): main changes only through the merge queue,
+# which has already run this workflow on the same commit, so a push run
+# repeated it. A nightly run on main instead catches drift against
+# claude@latest and the runner images, and warms the caches that pull
+# requests and merge groups restore (only the default branch's caches are
+# shared). Dispatch it by hand to check main at any time.
+
+on:
+  pull_request:
+  merge_group:
+  schedule:
+    - cron: "23 4 * * *" # nightly, 04:23 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # A newer push to a pull request, or a rebuilt merge group, supersedes the
+  # running one. Nightly and dispatched runs on main are never cancelled; the
+  # event name keeps a dispatch from replacing a pending nightly (#157).
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
+
+env:
+  DISABLE_AUTOUPDATER: "1"
+  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+
+jobs:
+  # Which areas this change can affect (#260, .github/scripts/ci_paths.py):
+  # plugin is false only if every changed file is a root *.md or LICENSE;
+  # unit, native-host, wsl and connected-failure then skip.
+  # An unknown base or another event (schedule, workflow_dispatch) runs
+  # everything.
+  #
+  # On merge_group only, reuse (#289, .github/scripts/ci_reuse.py) is true
+  # when the merge group's tree equals its one PR's up-to-date head, whose
+  # pull_request run of this workflow passed with every job run: the same
+  # tree, so the same ci.yml, scripts and tests. unit, wsl and
+  # connected-failure then skip and native-host runs only the leg pull
+  # requests leave out. Any doubt, an API error, or a failure of the step
+  # itself leaves reuse unset: a full run. Other events never reuse.
+  changes:
+    name: changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read # checkout, commits and compare
+      actions: read # the PR's ci run and its jobs
+      pull-requests: read # the PR's head and commit count
+    outputs:
+      plugin: ${{ steps.paths.outputs.plugin }}
+      reuse: ${{ steps.reuse.outputs.reuse }}
+      reused-run: ${{ steps.reuse.outputs.run }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # the base commit, to diff against
+          persist-credentials: false
+      - id: paths
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+        run: python3 -I -B .github/scripts/ci_paths.py changes --base "$BASE"
+      - id: reuse
+        name: Reuse the PR's passing run if the merge group's tree is the same
+        if: github.event_name == 'merge_group'
+        continue-on-error: true # a failure leaves reuse unset: run in full
+        timeout-minutes: 2
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          HEAD_REF: ${{ github.event.merge_group.head_ref }}
+          HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+          BASE_SHA: ${{ github.event.merge_group.base_sha }}
+        run: python3 -I -B .github/scripts/ci_reuse.py
+
+  # The hook tests and Python regressions, once per OS: they do not use the
+  # installed Claude Code, so running them per claude version repeated them.
+  # Windows runs the regressions with its native Python, then the Bash
+  # entry points that differ under Git Bash. ubuntu-24.04-arm is the arm64
+  # Linux leg (#30, docs/platform-matrix.md); the native-host gate stays on
+  # x64 runners.
+  unit:
+    name: unit (${{ matrix.os }})
+    needs: changes
+    if: needs.changes.outputs.plugin == 'true' && needs.changes.outputs.reuse != 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.10"
+          cache: pip
+          cache-dependency-path: requirements-hooks.txt
+      - name: Install pinned offline hook tokenizer
+        run: |
+          python -m pip install --require-hashes --only-binary=:all: -r requirements-hooks.txt
+      - name: Hook tests (fixture payloads)
+        if: runner.os != 'Windows'
+        env:
+          # The full pure_bpe code-point sweep (about 30 s) runs in this one
+          # job; it is platform-independent, so other jobs check a sample.
+          ORK_SLOW_TESTS: ${{ matrix.os == 'ubuntu-latest' && '1' || '0' }}
+          # tests/workflow_yaml_regressions.py must parse every workflow here
+          # (with the runner's ruby), not skip for want of a parser.
+          ORK_REQUIRE_YAML_PARSE: ${{ matrix.os == 'ubuntu-latest' && '1' || '0' }}
+        run: bash tests/run.sh
+      - name: Native Windows Python hooks and regressions
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: python -I -B .github/scripts/check-native-python.py
+      - name: Windows Bash runtime and session-start entry points
+        if: runner.os == 'Windows'
+        run: |
+          bash tests/runtime.test.sh
+          bash tests/session-start.test.sh
+
+  # Installed-host qualification against each OS and Claude Code version: the
+  # minimum required by connect-once capture, and latest. A pull request
+  # skips macOS with the minimum version (macOS minutes cost ten times
+  # Linux's); merge groups and nightly runs keep all six, so every
+  # combination qualifies before a change reaches main (#140). A merge group
+  # that reuses its PR's run (#289) runs only that left-out leg.
+  native-host:
+    name: native-host (${{ matrix.os }}, claude ${{ matrix.claude }})
+    needs: changes
+    if: needs.changes.outputs.plugin == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        claude: ["2.1.280", latest]
+        # Outside a pull request the os never matches, so nothing is excluded.
+        exclude:
+          - os: ${{ github.event_name == 'pull_request' && 'macos-latest' || 'none' }}
+            claude: "2.1.280"
+          # On reuse, every leg but the one above: the PR run passed those.
+          - os: ${{ needs.changes.outputs.reuse == 'true' && 'ubuntu-latest' || 'none' }}
+          - os: ${{ needs.changes.outputs.reuse == 'true' && 'windows-latest' || 'none' }}
+          - os: ${{ needs.changes.outputs.reuse == 'true' && 'macos-latest' || 'none' }}
+            claude: latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.10"
+          cache: pip
+          cache-dependency-path: requirements-hooks.txt
+      - name: Install Claude Code ${{ matrix.claude }}
+        uses: ./.github/actions/install-claude
+        with:
+          version: ${{ matrix.claude }}
+      - name: Validate the plugin manifest and its components
+        run: claude plugin validate --strict .claude-plugin/plugin.json
+      - name: Validate the marketplace manifest
+        run: claude plugin validate --strict .claude-plugin/marketplace.json
+      - name: Install pinned native-screen tokenizer
+        run: |
+          python -m pip install --require-hashes --only-binary=:all: -r requirements-hooks.txt
+      - name: Installed-host qualification (localhost inference, no skipped cases)
+        env:
+          RUN_NATIVE_CLAUDE_TESTS: "1"
+        run: python -I -B .github/scripts/check-native-host.py --report .local/checks/native-host.json
+
+  # WSL2 (#30, docs/platform-matrix.md): the unit suite and the installed-host
+  # gate inside Ubuntu 24.04 under WSL2 on a GitHub-hosted Windows runner,
+  # with Node, Python and Claude Code installed in the distribution, not taken
+  # from Windows (.github/scripts/wsl-setup.sh). Steps run as an ordinary
+  # user, as WSL users do: root ignores the file modes some tests check.
+  # Latest Claude Code only; native-host covers the minimum on the other OSes.
+  wsl:
+    name: wsl (ubuntu-24.04, claude latest)
+    needs: changes
+    if: needs.changes.outputs.plugin == 'true' && needs.changes.outputs.reuse != 'true'
+    runs-on: windows-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: wsl-bash {0}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Vampire/setup-wsl@4c48163d9f981914dd8caa0fc335fe19cca5bff4 # v7.2.0
+        with:
+          distribution: Ubuntu-24.04
+          additional-packages: git curl ca-certificates xz-utils python3-venv
+          wsl-shell-user: ork
+      # setup-wsl creates wsl-shell-user; the steps below run as that user.
+      - name: Show the distribution and user
+        run: |
+          uname -a
+          grep -E '^PRETTY_NAME=' /etc/os-release
+          id
+      - name: Install Node, Python venv and Claude Code latest in WSL
+        run: bash .github/scripts/wsl-setup.sh "$PWD" latest
+      - name: Hook tests (fixture payloads)
+        run: |
+          . ~/ci-env.sh
+          bash tests/run.sh
+      - name: Validate the plugin and marketplace manifests
+        run: |
+          . ~/ci-env.sh
+          claude plugin validate --strict .claude-plugin/plugin.json
+          claude plugin validate --strict .claude-plugin/marketplace.json
+      - name: Installed-host qualification (localhost inference, no skipped cases)
+        run: |
+          . ~/ci-env.sh
+          RUN_NATIVE_CLAUDE_TESTS=1 python3 -I -B .github/scripts/check-native-host.py --report .local/checks/native-host.json
+
+  # Connected-credential failure modes against a fake Ork Meter (#45,
+  # docs/failure-behaviour.md). Linux only: the runtime's credential store is a
+  # gnome-keyring in a D-Bus session private to this job, and the fake
+  # platform's throwaway CA is trusted on this runner only. Never on fork PRs
+  # (the job installs a CA with sudo); the suite refuses to run anywhere
+  # ORK_CONNECTED_FAILURE_CI is not 1.
+  connected-failure:
+    name: connected failure modes (linux)
+    needs: changes
+    if: >-
+      needs.changes.outputs.plugin == 'true' && needs.changes.outputs.reuse != 'true' &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.10"
+          cache: pip
+          cache-dependency-path: requirements-hooks.txt
+      - name: Install Claude Code latest
+        uses: ./.github/actions/install-claude
+        with:
+          version: latest
+      - name: Install the pinned tokenizer, D-Bus and gnome-keyring
+        run: |
+          python -m pip install --require-hashes --only-binary=:all: -r requirements-hooks.txt
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends dbus dbus-x11 gnome-keyring libsecret-tools
+      - name: Trust the fake platform's throwaway CA on this runner
+        run: |
+          ca="$RUNNER_TEMP/fake-platform-ca"
+          python3 -I -B tests/fake_platform.py make-ca "$ca"
+          sudo cp "$ca/ca.pem" /usr/local/share/ca-certificates/ork-meter-fake-platform-ci.crt
+          sudo update-ca-certificates
+          echo "ORK_FAKE_PLATFORM_CA=$ca" >> "$GITHUB_ENV"
+      - name: Connected failure suite (private D-Bus session and keyring)
+        env:
+          RUN_NATIVE_CLAUDE_TESTS: "1"
+          ORK_CONNECTED_FAILURE_CI: "1"
+        # zalando/go-keyring's own CI recipe: a throwaway password unlocks
+        # (creating) the login keyring. secret-tool proves the Secret Service
+        # answers before the suite relies on it.
+        run: |
+          dbus-run-session -- bash -c '
+            set -euo pipefail
+            head -c 24 /dev/urandom | base64 | gnome-keyring-daemon --unlock >/dev/null
+            printf probe | secret-tool store --label=ork-meter-ci-probe service ork-meter-ci-probe account probe
+            [ "$(secret-tool lookup service ork-meter-ci-probe account probe)" = probe ]
+            secret-tool clear service ork-meter-ci-probe account probe
+            echo "Secret Service ready on $DBUS_SESSION_BUS_ADDRESS"
+            python3 -I -B tests/native_failure_connected_qualification.py -v'
+
+  # A change to runtime/ must bring binaries the package-runtime workflow
+  # built and attested on main (#124); v0.3.0's predate attestation and are
+  # the only exemption (docs/release.md, "How the runtime is verified").
+  # Nightly and dispatched runs have no base commit, so they verify every
+  # binary. The attestations come from package-runtime, not from CI runs.
+  runtime-provenance:
+    name: runtime provenance
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      attestations: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # the base commit, to see whether runtime/ changed
+          persist-credentials: false
+      - name: Verify runtime binaries' build provenance if runtime/ changed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+        run: |
+          set -euo pipefail
+          # An unknown base counts as changed: verify rather than skip.
+          if git cat-file -e "${BASE}^{commit}" 2>/dev/null && git diff --quiet "$BASE" HEAD -- runtime/; then
+            echo "runtime/ unchanged since $BASE; nothing to verify."
+            exit 0
+          fi
+          python3 .github/scripts/verify-runtime-attestations.py runtime
+
+  # The release channel (#142, docs/release.md "Release channel"): the
+  # marketplace installs a merged release tag pinned by commit, and a change to
+  # the executable surface after the latest v* tag bumps plugin.json's version
+  # above it. Stateless: it compares HEAD (the PR merge commit, the merge group
+  # or main's head at night) with the tag, so it behaves the same in all three.
+  release-channel:
+    name: release channel
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # the v* tags and their commits
+          persist-credentials: false
+      - name: Require a version bump if the executable surface changed since the latest release
+        run: python3 -I -B .github/scripts/check-version-bump.py
+      - name: Require the marketplace to pin a merged release tag
+        run: python3 -I -B .github/scripts/point-marketplace.py check
+
+  ci-gate:
+    name: ci-gate
+    if: always()
+    needs: [changes, unit, native-host, wsl, runtime-provenance, release-channel, connected-failure]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: All plugin jobs passed
+        env:
+          CHANGES: ${{ needs.changes.result }}
+          PLUGIN_AFFECTED: ${{ needs.changes.outputs.plugin }}
+          # Only a merge group can reuse its PR's run (#289).
+          REUSE: ${{ github.event_name == 'merge_group' && needs.changes.outputs.reuse || 'false' }}
+          REUSED_RUN: ${{ needs.changes.outputs.reused-run }}
+          UNIT: ${{ needs.unit.result }}
+          NATIVE_HOST: ${{ needs.native-host.result }}
+          WSL: ${{ needs.wsl.result }}
+          PROVENANCE: ${{ needs.runtime-provenance.result }}
+          CHANNEL: ${{ needs.release-channel.result }}
+          CONNECTED: ${{ needs.connected-failure.result }}
+          FORK: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+        run: |
+          echo "changes: $CHANGES (plugin affected: $PLUGIN_AFFECTED)"
+          echo "reuse: ${REUSE:-false} ${REUSED_RUN}"
+          echo "unit matrix: $UNIT"
+          echo "native-host matrix: $NATIVE_HOST"
+          echo "wsl: $WSL"
+          echo "runtime provenance: $PROVENANCE"
+          echo "release channel: $CHANNEL"
+          echo "connected failure modes: $CONNECTED (fork PR: $FORK)"
+          # Explicit exits: under bash -e a failed test inside an && or ||
+          # list does not stop the script (the first version let a failed
+          # connected job through). A matrix's result is failure or
+          # cancelled if any leg was. The changes and always-on jobs must
+          # succeed. unit, native-host, wsl and connected-failure may be skipped
+          # only if the changes job succeeded and said the plugin is
+          # unaffected (#260); the connected job also on a fork PR. unit, wsl
+          # and connected-failure also if it said a merge group reuses its
+          # PR's run (#289); native-host still runs a leg then, so not it.
+          for result in "$CHANGES" "$PROVENANCE" "$CHANNEL"; do
+            [ "$result" = "success" ] || exit 1
+          done
+          accept() { python3 -I -B .github/scripts/ci_paths.py accept "$1" "$CHANGES" "$PLUGIN_AFFECTED" --reused "${2:-false}"; }
+          accept "$NATIVE_HOST" || exit 1
+          for result in "$UNIT" "$WSL"; do
+            accept "$result" "$REUSE" || exit 1
+          done
+          if ! accept "$CONNECTED" "$REUSE"; then
+            if [ "$FORK" != "true" ] || [ "$CONNECTED" != "skipped" ]; then exit 1; fi
+          fi

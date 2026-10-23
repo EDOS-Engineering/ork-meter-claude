@@ -1,0 +1,21 @@
+{
+  "name": "edos",
+  "owner": {
+    "name": "EDOS",
+    "url": "https://edos.io"
+  },
+  "metadata": {
+    "description": "EDOS plugins for Claude Code."
+  },
+  "plugins": [
+    {
+      "name": "ork-meter",
+      "source": {
+        "source": "url",
+        "url": "https://github.com/EDOS-Engineering/ork-meter-claude.git"
+      },
+      "description": "Connect once, then track token-counter metadata automatically in normal Claude Code sessions, and, with Ork Meter Plus, trim tool output, repeated reads and test noise locally.",
+      "category": "monitoring"
+    }
+  ]
+}

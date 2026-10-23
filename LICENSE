@@ -1,0 +1,39 @@
+Ork Meter for Claude Code - Limited Use License
+
+Copyright (c) 2026 Enterprise DevOps Solutions LLC ("EDOS"). All rights not
+expressly granted below are reserved.
+
+1. Grant. If you hold an Ork Meter or Ork Meter Plus account in good
+   standing, EDOS grants you a personal, non-exclusive, non-transferable,
+   revocable licence to install, run and configure this Claude Code plugin
+   and the Ork Meter runtime it carries, for your normal use with the Ork
+   Meter service.
+
+2. Restrictions. You may not:
+   (a) use the software without an Ork Meter or Ork Meter Plus account;
+   (b) redistribute, sell, rent or otherwise make the software, or any
+       modified version of it, available to others;
+   (c) sublicense any right granted here; or
+   (d) use the software, or any part of it, to build, provide or support a
+       product or service that competes with Ork Meter.
+
+3. Termination. This licence ends automatically when your account ends or
+   if you breach these terms. On termination you must stop using the
+   software and delete your copies.
+
+4. Third-party components. Components listed in THIRD_PARTY_NOTICES.md and
+   runtime/THIRD_PARTY_NOTICES.txt are licensed under their own terms, which
+   govern those components.
+
+5. No warranty. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
+   KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+   MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN
+   NO EVENT SHALL EDOS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+   WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF
+   OR IN CONNECTION WITH THE SOFTWARE OR ITS USE.
+
+6. Governing law. This licence is governed by the laws of the State of
+   Idaho and the federal laws of the United States, without regard to
+   conflict-of-law rules. Any dispute arising from it will be brought in the
+   state or federal courts located in Idaho, and you and EDOS consent to
+   their jurisdiction. There is no agreement to arbitrate.

@@ -1,0 +1,18 @@
+# Who may sign release tags (docs/release.md, "Signed release tags").
+#
+# publish-release refuses a tag v<version> unless it is SSH-signed by a key
+# listed here for the tag's tagger email (.github/scripts/check-tag-signature.py,
+# main's copy of this file). One line per key, in ssh-keygen(1)
+# ALLOWED SIGNERS format, restricted to git signatures:
+#
+#   <email> namespaces="git" <key type> <public key> [comment]
+#
+# The email is the one `git config user.email` sets when the human tags; it
+# must match exactly (no patterns). Optional valid-after="YYYYMMDD" and
+# valid-before="YYYYMMDD" bound a key's life; to revoke a key, delete its line
+# or set valid-before. Changes go through a pull request a human merges
+# (.github/ is a controlled path).
+#
+# No signer is listed yet, so every tag is refused until one is added.
+travis@edos.io namespaces="git" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGm76hA0KeOy0ONqHlPHXnZxu0US8mGYbj/uB7UHAHPv
+529446+defenestrator@users.noreply.github.com namespaces="git" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHDDzhdGfNlpVc7zGDz0yQMY+RkXbktYueyTxmfW+B4H defenestrator

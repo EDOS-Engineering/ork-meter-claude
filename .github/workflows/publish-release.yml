@@ -1,0 +1,483 @@
+name: publish-release
+
+# Publishes the GitHub Release for a plugin version that is already merged to
+# `main` and tagged v<version> by a human (docs/release.md, "Cutting a
+# release"). `main` is the release; this workflow adds the downloadable form of
+# it: a zip of the tagged plugin tree as installed, each bundled runtime binary
+# as its own asset, a .sha256 file per asset, a manifest.json (plugin version,
+# ork-meter ref, per-asset sha256) and build provenance attestations. It builds
+# nothing from source: the binaries are the ones the reviewed release commit
+# carries, re-verified against their SHA256 files and against the build
+# provenance attestation package-runtime made when it built them. The tag must
+# be SSH-signed by a signer listed in .github/allowed_signers, and the Release
+# carries an SPDX SBOM of its assets whose digest is in manifest.json. The publish
+# job never pushes a branch or a tag. It publishes a Release on the existing
+# tag, though, and if that tag were deleted just before publishing (possible
+# only if the release-tags ruleset were loosened), GitHub would create a
+# lightweight v<version> on the release commit. The job then sees the wrong
+# tag, turns the Release back into a draft and fails, but that tag stays until
+# a human removes it (docs/release.md, "Signed release tags"). Afterwards the
+# point-marketplace job opens the pull request that moves the marketplace to
+# the new tag, which is what makes the release installable; a human merges it
+# (docs/release.md, "Release channel"). That job never pushes to main and
+# never pushes a tag. Manual dispatch only, from `main`, behind the protected
+# `production` environment: publication is a reviewed release operation
+# (CONTRIBUTING, condition 3). See docs/release.md, "Publishing the GitHub
+# Release".
+
+on:
+  workflow_dispatch:
+    inputs:
+      plugin_version:
+        description: "plugin version to publish (semver, e.g. 0.3.0); the tag v<version> must already exist on main"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+# One release publication at a time.
+concurrency:
+  group: publish-release
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: verify tests and production gate
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.10"
+      - name: Install pinned offline hook tokenizer
+        run: |
+          python -m pip install --require-hashes --only-binary=:all: -r requirements-hooks.txt
+      - name: Run plugin tests
+        env:
+          # Releases are rare, so they keep the full pure_bpe code-point sweep.
+          ORK_SLOW_TESTS: "1"
+        run: bash tests/run.sh
+      - name: Require an existing protected production environment
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/environments/production" > "$RUNNER_TEMP/production.json"
+          gh api "repos/$GITHUB_REPOSITORY/environments/production/deployment-branch-policies?per_page=100" > "$RUNNER_TEMP/production-branches.json"
+          python3 .github/scripts/check-release-gate.py "$RUNNER_TEMP/production.json" "$RUNNER_TEMP/production-branches.json"
+
+  publish:
+    needs: verify
+    if: github.ref == 'refs/heads/main'
+    environment: production
+    name: publish GitHub Release v${{ inputs.plugin_version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write # create the GitHub Release on the existing tag; never pushes a branch or a tag (see the header for the one residual tag case)
+      id-token: write # sign the build provenance attestation
+      attestations: write # store the attestation on this repository
+    # The tag object and commit this job verified (signature included). Later
+    # steps and jobs refuse a tag that no longer resolves to them.
+    outputs:
+      tag_object: ${{ steps.release.outputs.tag_object }}
+      commit: ${{ steps.release.outputs.commit }}
+    env:
+      PLUGIN_VERSION: ${{ inputs.plugin_version }}
+    steps:
+      - name: Check out the plugin with its tags
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # the tag, its commit and main's history for the ancestry check
+          persist-credentials: false
+
+      - name: Validate the version, the tag and the release commit
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$PLUGIN_VERSION" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'; then
+            echo "::error::plugin_version '$PLUGIN_VERSION' is not semver (expected e.g. 0.3.0)."; exit 1
+          fi
+          tag="v$PLUGIN_VERSION"
+          if ! git rev-parse -q --verify "refs/tags/$tag^{commit}" >/dev/null; then
+            echo "::error::tag $tag does not exist. A human signs a tag on the merged release commit first (docs/release.md, \"Cutting a release\")."; exit 1
+          fi
+          commit=$(git rev-parse "refs/tags/$tag^{commit}")
+          if ! git merge-base --is-ancestor "$commit" "origin/main"; then
+            echo "::error::tag $tag ($commit) is not on main; only merged release commits are published."; exit 1
+          fi
+          subject=$(git log -1 --format=%s "$commit")
+          if ! printf '%s' "$subject" | grep -Eq "^release: plugin $(printf '%s' "$PLUGIN_VERSION" | sed 's/[.+]/\\&/g') with runtime from ork-meter [^ ]+$"; then
+            echo "::error::$tag points at '$subject', not at the release commit 'release: plugin $PLUGIN_VERSION with runtime from ork-meter <ref>' the package-runtime workflow opened."; exit 1
+          fi
+          # The subject is only a claim: also require the package-runtime
+          # workflow's author and a payload of runtime/ and plugin.json alone.
+          python3 .github/scripts/check-release-commit.py "$commit"
+          ork_meter_ref=${subject##* }
+          ork_meter_commit=$(git log -1 --format=%b "$commit" | sed -n -E "s/^Runtime built from EDOS-Engineering\/ork-meter [^ ]+ \(([0-9a-f]{40})\)\$/\1/p" | head -1)
+          # package-runtime always names it; without it the SBOM could not tie
+          # the binaries to an ork-meter commit.
+          if [ -z "$ork_meter_commit" ]; then
+            echo "::error::$tag's commit message names no ork-meter commit ('Runtime built from EDOS-Engineering/ork-meter <ref> (<sha>)'), so its binaries cannot be tied to one."; exit 1
+          fi
+          manifest_version=$(git show "$commit:.claude-plugin/plugin.json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])')
+          if [ "$manifest_version" != "$PLUGIN_VERSION" ]; then
+            echo "::error::plugin.json at $tag says version $manifest_version, not $PLUGIN_VERSION."; exit 1
+          fi
+          # Drafts included: a draft left by an earlier run must never be the
+          # one this run publishes.
+          existing=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq ".[] | select(.tag_name == \"$tag\") | \"\(.id) draft=\(.draft)\"")
+          if [ -n "$existing" ]; then
+            echo "::error::a GitHub Release for $tag already exists ($(echo $existing)); releases are never rewritten (docs/release.md, \"Rollback\"). A stale draft (draft=true) is deleted by hand: gh api -X DELETE repos/$GITHUB_REPOSITORY/releases/<id>"; exit 1
+          fi
+          {
+            echo "tag=$tag"
+            echo "tag_object=$(git rev-parse "refs/tags/$tag")"
+            echo "commit=$commit"
+            echo "ork_meter_ref=$ork_meter_ref"
+            echo "ork_meter_commit=$ork_meter_commit"
+          } >> "$GITHUB_OUTPUT"
+          echo "publishing $tag at $commit (runtime from ork-meter $ork_meter_ref $ork_meter_commit)"
+
+      # With main's copy of the script and of .github/allowed_signers, before
+      # anything is attested or uploaded: the human who tagged the release
+      # commit signed the tag with a key listed for their email
+      # (docs/release.md, "Signed release tags"). Main's copies are kept for
+      # the re-check under the draft Release, after the tagged commit is
+      # checked out.
+      - name: Require the tag to be SSH-signed by a signer in .github/allowed_signers
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+          COMMIT: ${{ steps.release.outputs.commit }}
+        run: |
+          set -euo pipefail
+          mkdir "$RUNNER_TEMP/main-checks"
+          cp .github/scripts/check-tag-signature.py .github/allowed_signers "$RUNNER_TEMP/main-checks/"
+          python3 -I -B "$RUNNER_TEMP/main-checks/check-tag-signature.py" --tag "$TAG" --commit "$COMMIT" \
+            --allowed-signers "$RUNNER_TEMP/main-checks/allowed_signers" | tee "$RUNNER_TEMP/tag-signature"
+
+      # With main's copy of the script, before anything is attested or
+      # uploaded: every binary must carry package-runtime's build attestation.
+      - name: Verify each runtime binary was built by package-runtime on main
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT: ${{ steps.release.outputs.commit }}
+        run: |
+          set -euo pipefail
+          mkdir "$RUNNER_TEMP/tagged"
+          git archive "$COMMIT" runtime/ | tar -x -C "$RUNNER_TEMP/tagged"
+          python3 .github/scripts/verify-runtime-attestations.py "$RUNNER_TEMP/tagged/runtime"
+
+      - name: Check out the tagged release commit
+        env:
+          COMMIT: ${{ steps.release.outputs.commit }}
+        run: |
+          set -euo pipefail
+          git checkout -q --detach "$COMMIT"
+          git status --short --untracked-files=all | sed 's/^/unexpected: /' | tee "$RUNNER_TEMP/dirty"
+          [ ! -s "$RUNNER_TEMP/dirty" ]
+
+      # For the SBOM's Python packages: what `pip install -r
+      # requirements-hooks.txt` resolves to now, with each wheel's SHA-256.
+      # Nothing is installed, and wheels only, so no package code runs; the
+      # step never gets the job's OIDC token request credentials.
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.10"
+      - name: Resolve the hooks' Python dependencies for the SBOM
+        run: |
+          set -euo pipefail
+          unset ACTIONS_ID_TOKEN_REQUEST_URL ACTIONS_ID_TOKEN_REQUEST_TOKEN
+          python -m pip install --dry-run --ignore-installed --only-binary=:all: --no-cache-dir --quiet \
+            --report "$RUNNER_TEMP/pip-report.json" -r requirements-hooks.txt
+          python -c 'import json,sys; [print(i["metadata"]["name"], i["metadata"]["version"]) for i in json.load(open(sys.argv[1]))["install"]]' "$RUNNER_TEMP/pip-report.json"
+
+      - name: Assemble the release assets from the reviewed commit
+        env:
+          ORK_METER_REF: ${{ steps.release.outputs.ork_meter_ref }}
+          ORK_METER_COMMIT: ${{ steps.release.outputs.ork_meter_commit }}
+          COMMIT: ${{ steps.release.outputs.commit }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/build-release-assets.py --version "$PLUGIN_VERSION" --ork-meter-ref "$ORK_METER_REF" \
+            --ork-meter-commit "$ORK_METER_COMMIT" --archive-ref "$COMMIT" --output "$RUNNER_TEMP/release" \
+            --pip-report "$RUNNER_TEMP/pip-report.json"
+          ls -l "$RUNNER_TEMP/release"
+
+      - name: Attest build provenance for every asset
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            ${{ runner.temp }}/release/ork-meter-claude-plugin-*.zip
+            ${{ runner.temp }}/release/ork-meter-claude-plugin-*.spdx.json
+            ${{ runner.temp }}/release/ork-meter-plugin-runtime-*
+            ${{ runner.temp }}/release/manifest.json
+
+      # Creating a Release on a tag checks at most that the name exists on
+      # GitHub, and a Release binds to whatever its tag points at when it is
+      # published. So: require GitHub's v<version> to be the very tag object
+      # verified above, create the Release as a draft, re-check GitHub's tag
+      # object and commit under the draft, and only then publish it. A failed
+      # re-check deletes the draft, so nothing is ever published on a tag
+      # that moved (the release-tags ruleset already limits who can move it).
+      - name: Require GitHub's tag to be the verified tag object
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+          TAG_OBJECT: ${{ steps.release.outputs.tag_object }}
+        run: |
+          set -euo pipefail
+          remote=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq '.object.type + " " + .object.sha')
+          if [ "$remote" != "tag $TAG_OBJECT" ]; then
+            echo "::error::GitHub's $TAG is now '$remote', not the verified tag object $TAG_OBJECT; nothing is published."; exit 1
+          fi
+
+      - name: Create the GitHub Release on the existing tag, as a draft
+        id: draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+          TAG_OBJECT: ${{ steps.release.outputs.tag_object }}
+          COMMIT: ${{ steps.release.outputs.commit }}
+          ORK_METER_REF: ${{ steps.release.outputs.ork_meter_ref }}
+          DISPATCHER: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          release="$RUNNER_TEMP/release"
+          {
+            echo "Ork Meter plugin for Claude Code $PLUGIN_VERSION."
+            echo
+            echo "Install through the EDOS marketplace (README, \"Connect\"). It serves this version once the pull request that points it at $TAG is merged (docs/release.md, \"Release channel\"):"
+            echo
+            echo '```text'
+            echo "/plugin marketplace add EDOS-Engineering/ork-meter-claude"
+            echo "/plugin install ork-meter@edos"
+            echo '```'
+            echo
+            echo "- plugin commit: $COMMIT (tag $TAG on main)"
+            echo "- runtime: EDOS-Engineering/ork-meter $ORK_METER_REF, the binaries the release commit carries"
+            echo "- published by: @$DISPATCHER through the production environment, run ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo "- provenance: each asset has a build provenance attestation; verify with \`gh attestation verify <asset> --repo ${GITHUB_REPOSITORY}\`"
+            echo "- signed tag: $(cat "$RUNNER_TEMP/tag-signature")"
+            echo "- SBOM: ork-meter-claude-plugin-$PLUGIN_VERSION.spdx.json (SPDX 2.3): the zip, each runtime binary with the Go modules linked into it, the bundled tokenizer vocabulary and the hooks' optional Python packages (docs/release.md, \"SBOM\")"
+            echo
+            echo "Assets: the plugin tree as installed (zip), each runtime binary, the SBOM, a .sha256 per asset and manifest.json. The binaries are unsigned (docs/release.md, \"Signing and Gatekeeper on macOS\")."
+            echo
+            echo "| asset | SHA256 |"
+            echo "|---|---|"
+            python3 -c 'import json,sys; [print(f"| {n} | `{s}` |") for n, s in json.load(open(sys.argv[1]))["assets"].items()]' "$release/manifest.json"
+          } > "$RUNNER_TEMP/notes"
+          # Created through the API so the draft's id comes back with it; from
+          # here on the Release is addressed by that id, never found by tag
+          # name. target_commitish: should the tag vanish, GitHub would
+          # otherwise create one on main's HEAD when the Release is published.
+          id=$(gh api -X POST "repos/$GITHUB_REPOSITORY/releases" -f tag_name="$TAG" -f target_commitish="$COMMIT" \
+            -F draft=true -f name="Ork Meter plugin $PLUGIN_VERSION" -F body=@"$RUNNER_TEMP/notes" --jq .id)
+          if ! [[ "$id" =~ ^[0-9]+$ ]]; then
+            echo "::error::creating the draft Release for $TAG returned no id ('$id')."; exit 1
+          fi
+          # Recorded before the uploads, so cleanup deletes this draft by id.
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+          # By id as well: gh's own upload command finds the Release by tag name.
+          for asset in "$release"/*; do
+            name=$(basename "$asset")
+            state=$(gh api -X POST "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$id/assets?name=$name" \
+              -H "Content-Type: application/octet-stream" --input "$asset" --jq .state)
+            if [ "$state" != "uploaded" ]; then
+              echo "::error::uploading $name to draft Release $id ended in state '$state'."; exit 1
+            fi
+          done
+
+      # The draft is invisible to customers. Publish it, by id, only if
+      # GitHub's tag is still the verified tag object on the verified commit:
+      # a git object id names its content, so that object still carries the
+      # signature checked above. (The signature check below repeats the first
+      # one against the same local clone; the API checks are the guard.) After
+      # publishing, the tag is read again; a mismatch turns the Release back
+      # into a draft and fails.
+      - name: Re-check the tag under the draft, then publish the Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.draft.outputs.id }}
+          TAG: ${{ steps.release.outputs.tag }}
+          TAG_OBJECT: ${{ steps.release.outputs.tag_object }}
+          COMMIT: ${{ steps.release.outputs.commit }}
+          ORK_METER_REF: ${{ steps.release.outputs.ork_meter_ref }}
+        run: |
+          set -euo pipefail
+          refuse() { echo "::error::$1 The draft Release is deleted; nothing is published."; exit 1; }
+          [[ "$RELEASE_ID" =~ ^[0-9]+$ ]] || refuse "no draft Release id from the create step."
+          draft=$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" --jq '"\(.draft) \(.tag_name)"') \
+            || refuse "cannot read the draft Release $RELEASE_ID."
+          [ "$draft" = "true $TAG" ] || refuse "Release $RELEASE_ID is '$draft', not this run's draft for $TAG."
+          remote=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq '.object.type + " " + .object.sha') \
+            || refuse "cannot read GitHub's $TAG."
+          [ "$remote" = "tag $TAG_OBJECT" ] || refuse "GitHub's $TAG is now '$remote', not the verified tag object $TAG_OBJECT."
+          target=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$TAG_OBJECT" --jq '.object.type + " " + .object.sha') \
+            || refuse "cannot read the tag object $TAG_OBJECT."
+          [ "$target" = "commit $COMMIT" ] || refuse "the tag object $TAG_OBJECT points at '$target', not the verified commit $COMMIT."
+          [ "$(git rev-parse "refs/tags/$TAG")" = "$TAG_OBJECT" ] || refuse "the local $TAG is not the verified tag object $TAG_OBJECT."
+          python3 -I -B "$RUNNER_TEMP/main-checks/check-tag-signature.py" --tag "$TAG" --commit "$COMMIT" \
+            --allowed-signers "$RUNNER_TEMP/main-checks/allowed_signers" || refuse "$TAG no longer passes the signature check."
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" -F draft=false \
+            -f tag_name="$TAG" -f target_commitish="$COMMIT" --silent
+          after=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq '.object.type + " " + .object.sha') || after="unreadable"
+          if [ "$after" != "tag $TAG_OBJECT" ]; then
+            echo "::error::GitHub's $TAG was '$after' right after publishing, not the verified tag object $TAG_OBJECT. Investigate the tag."
+            if gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" -F draft=true --silent; then
+              echo "::error::Release $RELEASE_ID is back to a draft, which the cleanup step deletes."
+            else
+              echo "::error::could not turn Release $RELEASE_ID back into a draft (immutable releases?); it is STILL PUBLISHED. Deal with it by hand."
+            fi
+            exit 1
+          fi
+          {
+            echo "## Ork Meter plugin $PLUGIN_VERSION: GitHub Release published"
+            echo
+            echo "- release: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/$TAG"
+            echo "- plugin commit: $COMMIT"
+            echo "- runtime: ork-meter $ORK_METER_REF"
+            echo
+            cat "$RUNNER_TEMP/notes" | sed -n '/^| asset/,$p'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # A failed or cancelled upload or re-check leaves a draft; remove it so
+      # no later run can meet it. Every draft for the tag goes (the create
+      # step may have been cancelled before it recorded the id): only drafts
+      # are ever deleted, never a published Release, and the tag is kept.
+      - name: Delete the draft Release after a failure or cancellation
+        if: (failure() || cancelled()) && steps.draft.conclusion != 'skipped'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.draft.outputs.id }}
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ -n "$RELEASE_ID" ]; then
+            ids=$RELEASE_ID
+          else
+            # Only if the create step stopped before GitHub returned the id;
+            # the run started with no Release for the tag.
+            ids=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+              --jq ".[] | select(.draft and .tag_name == \"$TAG\") | .id")
+          fi
+          for id in $ids; do
+            # Re-read right before deleting: only a draft for this tag goes.
+            state=$(gh api "repos/$GITHUB_REPOSITORY/releases/$id" --jq '"\(.draft) \(.tag_name)"' 2>/dev/null) || state="missing"
+            if [ "$state" = "true $TAG" ]; then
+              gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/$id"
+              echo "::error::deleted the draft Release $id for $TAG; nothing is published."
+            else
+              echo "::error::Release $id is '$state', not a draft for $TAG; left in place. If it is published, unpublish it by hand."
+            fi
+          done
+
+  # The release goes live when the marketplace points at its tag (docs/release.md,
+  # "Release channel"). This opens that pull request; it does not merge it.
+  point-marketplace:
+    needs: publish
+    if: github.ref == 'refs/heads/main'
+    name: open the pull request pointing the marketplace at v${{ inputs.plugin_version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # push the pull request's own branch, release-channel/v<version>; never main, never a tag
+      pull-requests: write # open that pull request against main
+    env:
+      PLUGIN_VERSION: ${{ inputs.plugin_version }}
+    steps:
+      - name: Check out main with its tags
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # the tag and main's history for the ancestry check
+
+      # Re-resolve nothing on trust: the tag must still be the object the
+      # publish job verified, and still pass the signature check (main's copy).
+      - name: Require the tag the publish job verified
+        env:
+          TAG_OBJECT: ${{ needs.publish.outputs.tag_object }}
+          COMMIT: ${{ needs.publish.outputs.commit }}
+        run: |
+          set -euo pipefail
+          tag="v$PLUGIN_VERSION"
+          object=$(git rev-parse "refs/tags/$tag")
+          commit=$(git rev-parse "refs/tags/$tag^{commit}")
+          if [ "$object" != "$TAG_OBJECT" ] || [ "$commit" != "$COMMIT" ]; then
+            echo "::error::$tag is now $object ($commit), not the tag object $TAG_OBJECT ($COMMIT) the publish job verified."; exit 1
+          fi
+          python3 -I -B .github/scripts/check-tag-signature.py --tag "$tag" --commit "$COMMIT" \
+            --allowed-signers .github/allowed_signers
+
+      - name: Open the pull request
+        env:
+          COMMIT: ${{ needs.publish.outputs.commit }}
+          DISPATCHER: ${{ github.actor }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="v$PLUGIN_VERSION"
+          branch="release-channel/$tag"
+          if git ls-remote --exit-code --heads origin "refs/heads/$branch" >/dev/null; then
+            echo "::error::branch $branch already exists; a pull request pointing the marketplace at $tag is open or was abandoned."; exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          python3 -I -B .github/scripts/point-marketplace.py set "$PLUGIN_VERSION"
+          if git diff --quiet; then
+            echo "::notice::the marketplace already points at $tag; nothing to open."; exit 0
+          fi
+          unexpected=$(git diff --name-only | grep -v '^\.claude-plugin/marketplace\.json$' || true)
+          if [ -n "$unexpected" ]; then
+            echo "::error::only marketplace.json may change; found: $unexpected"; exit 1
+          fi
+          sha=$(git rev-parse "refs/tags/$tag^{commit}")
+          if [ "$sha" != "$COMMIT" ]; then
+            echo "::error::$tag resolves to $sha, not the verified $COMMIT."; exit 1
+          fi
+          {
+            echo "release: point the marketplace at $tag"
+            echo
+            echo "Customers install the commit the marketplace names (docs/release.md,"
+            echo "\"Release channel\"). Generated by the publish-release workflow (run"
+            echo "${GITHUB_RUN_ID}) after it published the GitHub Release $tag ($sha)."
+            echo
+            echo "Dispatched-By: $DISPATCHER"
+            echo "Agent: publish-release"
+            echo "Agent-Version: github-actions"
+            echo "Model: none"
+          } > "$RUNNER_TEMP/commit-message"
+          git commit -q -a -F "$RUNNER_TEMP/commit-message"
+          git show --stat HEAD
+          git push origin "HEAD:refs/heads/$branch"
+          {
+            echo "## What and why"
+            echo
+            echo "Makes plugin $PLUGIN_VERSION installable: points the marketplace's \`ork-meter\` entry at tag \`$tag\`, pinned to its commit \`$sha\`. Until this merges, new installs and updates still get the previous release."
+            echo
+            echo "- GitHub Release: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/$tag"
+            echo "- workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo
+            echo "Merge it once the release has been installed and checked on each platform (docs/release.md, \"What this process does not cover\"). To roll back later, point the marketplace at an earlier tag the same way (docs/release.md, \"Rollback\")."
+            echo
+            echo "GitHub does not run CI on a pull request this workflow opens; close and reopen it to run \`ci\`."
+          } > "$RUNNER_TEMP/pr-body"
+          url=$(gh pr create --base main --head "$branch" \
+            --title "release: point the marketplace at $tag" --body-file "$RUNNER_TEMP/pr-body")
+          {
+            echo "## Marketplace pull request opened"
+            echo
+            echo "- pull request: $url"
+            echo "- next: install and check $tag, then merge it; that is when customers get $PLUGIN_VERSION"
+          } >> "$GITHUB_STEP_SUMMARY"

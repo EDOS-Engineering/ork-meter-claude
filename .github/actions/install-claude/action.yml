@@ -1,0 +1,59 @@
+name: Install Claude Code
+description: >-
+  Install a Claude Code version globally with npm, from a cache keyed on the
+  resolved version, retrying a broken install (#140).
+inputs:
+  version:
+    description: An npm version or dist-tag of @anthropic-ai/claude-code, such as 2.1.280 or latest.
+    required: true
+outputs:
+  version:
+    description: The exact version installed.
+    value: ${{ steps.resolve.outputs.version }}
+runs:
+  using: composite
+  steps:
+    - name: Resolve Claude Code ${{ inputs.version }}
+      id: resolve
+      shell: bash
+      env:
+        SPEC: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        for attempt in 1 2 3; do
+          if version=$(npm view "@anthropic-ai/claude-code@$SPEC" version) && [ -n "$version" ]; then break; fi
+          [ "$attempt" -lt 3 ] || { echo "::error::cannot resolve @anthropic-ai/claude-code@$SPEC"; exit 1; }
+          sleep $((attempt * 10))
+        done
+        # A range would print several versions; only exact versions and tags are inputs.
+        case "$version" in *[[:space:]]*) echo "::error::$SPEC resolves to more than one version"; exit 1 ;; esac
+        echo "Claude Code $SPEC is $version"
+        echo "version=$version" >> "$GITHUB_OUTPUT"
+        echo "cache=$(npm config get cache)" >> "$GITHUB_OUTPUT"
+    # Only the default branch's caches are shared with other refs; the nightly
+    # run on main keeps them warm for pull requests and merge groups.
+    - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.resolve.outputs.cache }}
+        key: npm-${{ runner.os }}-${{ runner.arch }}-claude-code-${{ steps.resolve.outputs.version }}
+    # One macOS run got the package without its platform-native optional
+    # dependency ("claude native binary not installed"). Retry a clean
+    # install, and require the CLI to report the resolved version.
+    - name: Install Claude Code ${{ steps.resolve.outputs.version }}
+      shell: bash
+      env:
+        VERSION: ${{ steps.resolve.outputs.version }}
+      run: |
+        set -uo pipefail
+        for attempt in 1 2 3; do
+          if npm install --global --no-fund --no-audit --prefer-offline "@anthropic-ai/claude-code@$VERSION" \
+              && reported=$(claude --version) && printf '%s\n' "$reported" | grep -qF "$VERSION"; then
+            echo "$reported"
+            exit 0
+          fi
+          echo "::warning::Claude Code $VERSION install attempt $attempt failed"
+          npm uninstall --global --no-fund --no-audit @anthropic-ai/claude-code || true
+          [ "$attempt" -lt 3 ] && sleep $((attempt * 10))
+        done
+        echo "::error::Claude Code $VERSION did not install after 3 attempts"
+        exit 1

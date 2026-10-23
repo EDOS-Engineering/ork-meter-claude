@@ -1,0 +1,32 @@
+{
+  "contract": "ork-evidence-behavior",
+  "version": 1,
+  "cases": [
+    {"id":"small","type":"output","kind":"log","parts":[{"text":"brief output\n"}],"expect":"passthrough"},
+    {"id":"json-object","type":"output","kind":"log","parts":[{"text":"{\n"},{"text":"\"value\":\"large\",\n","repeat":600},{"text":"\"last\":true}\n"}],"expect":"passthrough"},
+    {"id":"json-array","type":"output","kind":"log","parts":[{"text":"[\n"},{"text":"\"value\",\n","repeat":600},{"text":"null]\n"}],"expect":"passthrough"},
+    {"id":"json-string","type":"output","kind":"log","parts":[{"text":"\""},{"text":"opaque-value","repeat":600},{"text":"\"\n"}],"expect":"passthrough"},
+    {"id":"json-number","type":"output","kind":"log","parts":[{"text":"1"},{"text":"0","repeat":6000}],"expect":"passthrough"},
+    {"id":"html","type":"output","kind":"log","parts":[{"text":"<html>\n"},{"text":"<p>opaque</p>\n","repeat":600},{"text":"</html>\n"}],"expect":"passthrough"},
+    {"id":"yaml-header","type":"output","kind":"log","parts":[{"text":"---\n"},{"text":"- opaque-value\n","repeat":600}],"expect":"passthrough"},
+    {"id":"nul-control","type":"output","kind":"log","parts":[{"text":"opaque\u0000data\n"},{"text":"progress {i}\n","repeat":600,"indexed":true}],"expect":"passthrough"},
+    {"id":"unknown-control","type":"output","kind":"log","parts":[{"text":"opaque\u0007data\n"},{"text":"progress {i}\n","repeat":600,"indexed":true}],"expect":"passthrough"},
+    {"id":"ansi-json","type":"output","kind":"log","parts":[{"text":"\u001b[32m{\n"},{"text":"\"value\":1,\n","repeat":600},{"text":"\"last\":true}\u001b[0m\n"}],"expect":"passthrough"},
+    {"id":"unknown-bracket-tag","type":"output","kind":"log","parts":[{"text":"[opaque] payload\n"},{"text":"progress {i}\n","repeat":600,"indexed":true}],"expect":"passthrough"},
+    {"id":"diagnostics","type":"output","kind":"log","parts":[{"text":"progress {i}\n","repeat":350,"indexed":true},{"text":"Error: checkout expired expected 402 received 500\nError: retry changed idempotency key\n"},{"text":"progress {i}\n","repeat":350,"indexed":true}],"expect":"reduce","required":["Error: checkout expired expected 402 received 500","Error: retry changed idempotency key"]},
+    {"id":"skipped-security","type":"output","kind":"test","parts":[{"text":"test case_{i} ... ok\n","repeat":350,"indexed":true},{"text":"test critical_security_check ... ignored (requires vault)\n"},{"text":"test case_{i} ... ok\n","repeat":350,"indexed":true}],"expect":"reduce","required":["test critical_security_check ... ignored (requires vault)"]},
+    {"id":"diagnostic-soft-overflow","type":"output","kind":"log","parts":[{"text":"progress {i}\n","repeat":400,"indexed":true},{"text":"Error: distinct diagnostic {i} expected stable received changed\n","repeat":75,"indexed":true},{"text":"progress {i}\n","repeat":400,"indexed":true}],"expect":"reduce","required_parts":[{"text":"Error: distinct diagnostic {i} expected stable received changed\n","repeat":75,"indexed":true}],"minimum_output_bytes":1025},
+    {"id":"crlf-symbol","type":"source","text":"# prefix\r\n@decorate\r\nasync def target(value):\r\n    return value + 1\r\n# suffix\r\n","symbol":"target","expected":"@decorate\r\nasync def target(value):\r\n    return value + 1\r\n","start":2,"end":4},
+    {"id":"cr-symbol","type":"source","text":"# prefix\r@decorate\rdef target(value):\r    return value + 1\r# suffix\r","symbol":"target","expected":"@decorate\rdef target(value):\r    return value + 1\r","start":2,"end":4},
+    {"id":"bom-symbol","type":"source","text":"\ufeff@decorate\ndef target(value):\n    return value + 1\n# suffix\n","symbol":"target","expected":"\ufeff@decorate\ndef target(value):\n    return value + 1\n","start":1,"end":3},
+    {"id":"nested-unicode-symbol","type":"source","text":"class Handler:\n    # 雪\u2028still one physical line\n    @decorate\n    def run(self):\n        return '雪'\n# suffix\n","symbol":"Handler.run","expected":"    @decorate\n    def run(self):\n        return '雪'\n","start":3,"end":5},
+    {"id":"source-ambiguous","type":"source_error","text":"def target(): return 1\ndef target(): return 2\n","symbol":"target","error":"exact symbol"},
+    {"id":"source-stale","type":"source_error","text":"def target(): return 1\n","symbol":"target","expected_hash":"0000000000000000000000000000000000000000000000000000000000000000","error":"changed"},
+    {"id":"immutable-utf8-artifact","type":"artifact","parts":[{"text":"雪\r\nError: exact evidence\r\n"}],"corrupt":true},
+    {"id":"immutable-binary-artifact","type":"artifact","parts":[{"base64":"AP+Afw0K"}],"corrupt":true},
+    {"id":"emitted-recovery-net","type":"delivery","phase":"emitted","before":10000,"after":1000,"recovery":20000,"expected_net":-11000},
+    {"id":"write-failure-no-credit","type":"delivery","phase":"write_failed","before":10000,"after":1000,"recovery":0,"expected_net":0},
+    {"id":"flush-failure-no-credit","type":"delivery","phase":"flush_failed","before":10000,"after":1000,"recovery":0,"expected_net":0},
+    {"id":"abandoned-no-credit","type":"delivery","phase":"abandoned","before":10000,"after":1000,"recovery":0,"expected_net":0}
+  ]
+}

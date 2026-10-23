@@ -1,0 +1,244 @@
+name: package-runtime
+
+# Builds the plugin's Go runtime from EDOS-Engineering/ork-meter for every
+# supported platform and opens a release pull request against `main`: one
+# commit holding runtime/ (binaries and SHA256 files) and the plugin.json
+# version, nothing else. `main` is the release, so a human reviews and merges
+# that pull request through the merge queue and then signs a tag
+# v<plugin_version> on the merged commit (docs/release.md, "Signed release
+# tags"). This workflow never pushes to `main` and never creates a tag.
+# Manual dispatch only: publication is a reviewed release operation and
+# never happens on push (CONTRIBUTING, condition 3). After the tag exists, the
+# publish-release workflow creates the GitHub Release with the downloadable
+# assets. Each runtime binary gets a build provenance attestation signed by
+# this workflow at build time. See docs/release.md.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ork_meter_ref:
+        description: "ork-meter tag or commit to build the runtime from"
+        required: true
+        type: string
+      plugin_version:
+        description: "plugin version to publish (semver, e.g. 0.3.0); becomes plugin.json version, and the tag v<version> a human puts on the merged commit"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+# One release pull request at a time.
+concurrency:
+  group: package-runtime
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: verify tests and production gate
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Same interpreter floor and pinned offline tokenizer as ci.yml; without
+      # them the hooks pass output through and the reduction tests fail.
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.10"
+      - name: Install pinned offline hook tokenizer
+        run: |
+          python -m pip install --require-hashes --only-binary=:all: -r requirements-hooks.txt
+      - name: Run plugin tests
+        env:
+          # Releases are rare, so they keep the full pure_bpe code-point sweep.
+          ORK_SLOW_TESTS: "1"
+        run: bash tests/run.sh
+      - name: Require an existing protected production environment
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/environments/production" > "$RUNNER_TEMP/production.json"
+          gh api "repos/$GITHUB_REPOSITORY/environments/production/deployment-branch-policies?per_page=100" > "$RUNNER_TEMP/production-branches.json"
+          python3 .github/scripts/check-release-gate.py "$RUNNER_TEMP/production.json" "$RUNNER_TEMP/production-branches.json"
+
+  package:
+    needs: verify
+    if: github.ref == 'refs/heads/main'
+    environment: production
+    name: package ${{ inputs.plugin_version }} from ork-meter ${{ inputs.ork_meter_ref }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write # push the release pull request's own branch, package-runtime/v<version>; never main, never a tag
+      pull-requests: write # open the release pull request against main
+      id-token: write # sign the build provenance attestation of each runtime binary
+      attestations: write # store that attestation on this repository
+    env:
+      ORK_METER_REF: ${{ inputs.ork_meter_ref }}
+      PLUGIN_VERSION: ${{ inputs.plugin_version }}
+    steps:
+      - name: Check out the plugin at the dispatching ref
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # all branches and tags: needed for the tag and branch checks
+
+      - name: Check out ork-meter at the requested ref
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: EDOS-Engineering/ork-meter
+          ref: ${{ inputs.ork_meter_ref }}
+          token: ${{ secrets.ORK_METER_READ_TOKEN }} # read-only token for ork-meter; see docs/release.md
+          path: ork-meter
+          persist-credentials: false
+
+      - name: Validate the inputs and the platform source
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$PLUGIN_VERSION" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'; then
+            echo "::error::plugin_version '$PLUGIN_VERSION' is not semver (expected e.g. 0.3.0)."; exit 1
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/v$PLUGIN_VERSION" >/dev/null; then
+            echo "::error::tag v$PLUGIN_VERSION already exists; releases are never rewritten. Pick a new version (docs/release.md)."; exit 1
+          fi
+          if git ls-remote --exit-code --heads origin "refs/heads/package-runtime/v$PLUGIN_VERSION" >/dev/null; then
+            echo "::error::branch package-runtime/v$PLUGIN_VERSION already exists; a release pull request for this version is open or was abandoned. Close it and delete the branch, or pick a new version (docs/release.md)."; exit 1
+          fi
+          if [ ! -f ork-meter/cmd/claude-plugin-runtime/main.go ]; then
+            echo "::error::ork-meter at '$ORK_METER_REF' has no cmd/claude-plugin-runtime/main.go; choose a ref that carries the plugin runtime."; exit 1
+          fi
+          echo "plugin $PLUGIN_VERSION from $(git rev-parse --short HEAD) (${GITHUB_REF_NAME}); runtime from ork-meter $ORK_METER_REF = $(git -C ork-meter rev-parse HEAD)"
+
+      - name: Set up Go from ork-meter's go.mod
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: ork-meter/go.mod
+          cache-dependency-path: ork-meter/go.sum
+
+      - name: Build the runtime for every target and set the plugin version
+        run: |
+          set -euo pipefail
+          python3 scripts/package_runtime.py \
+            --platform-source ork-meter \
+            --targets darwin-arm64 darwin-amd64 linux-amd64 linux-arm64 windows-amd64 \
+            --output runtime \
+            --plugin-version "$PLUGIN_VERSION" \
+            --source-ref "$ORK_METER_REF"
+          ls -l runtime/*/
+
+      # Ties each binary's digest to this run of this workflow on main, right
+      # after the build and before anything runs a binary or pushes.
+      # publish-release and CI's runtime-provenance job refuse binaries
+      # without it (.github/scripts/verify-runtime-attestations.py).
+      - name: Attest build provenance for every runtime binary
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: runtime/*/ork-meter-plugin-runtime*
+
+      - name: Smoke-test the linux-amd64 runtime on the runner
+        # `--version` is the runtime's only argument-free, side-effect-free
+        # command. `status` through scripts/runtime.sh exercises the exact
+        # verify, install and exec path a customer's session runs, against a
+        # throwaway data directory; it reports "not connected" and exits 0.
+        run: |
+          set -euo pipefail
+          # The binary never gets the job's OIDC token request credentials.
+          unset ACTIONS_ID_TOKEN_REQUEST_URL ACTIONS_ID_TOKEN_REQUEST_TOKEN
+          ./runtime/linux-amd64/ork-meter-plugin-runtime --version
+          data="$RUNNER_TEMP/plugin-data"
+          mkdir -p "$data"
+          output=$(CLAUDE_PLUGIN_DATA="$data" bash scripts/runtime.sh status)
+          echo "$output"
+          printf '%s' "$output" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert "state" in d, d'
+
+      - name: Open the release pull request
+        env:
+          DISPATCHER: ${{ github.actor }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          source_commit=$(git rev-parse HEAD)
+          runtime_commit=$(git -C ork-meter rev-parse HEAD)
+          branch="package-runtime/v$PLUGIN_VERSION"
+          rm -rf ork-meter # never part of the release commit
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch" "$source_commit"
+          git add runtime/ .claude-plugin/plugin.json
+          test -s runtime/THIRD_PARTY_NOTICES.txt
+          # The release commit is exactly the payload, so each release is one
+          # commit in main's history that a later cleanup can find.
+          unexpected=$(git diff --cached --name-only | grep -Ev '^(runtime/(darwin|linux|windows)-(amd64|arm64)/(ork-meter-plugin-runtime(\.exe)?|SHA256)|runtime/THIRD_PARTY_NOTICES\.txt|\.claude-plugin/plugin\.json)$' || true)
+          if [ -n "$unexpected" ]; then
+            echo "::error::the release commit may hold only runtime/ binaries, their SHA256 files, runtime/THIRD_PARTY_NOTICES.txt and plugin.json; found: $unexpected"; exit 1
+          fi
+          git status --short
+          {
+            echo "release: plugin $PLUGIN_VERSION with runtime from ork-meter $ORK_METER_REF"
+            echo
+            echo "Generated by the package-runtime workflow (run ${GITHUB_RUN_ID}) from"
+            echo "plugin commit $source_commit on ${GITHUB_REF_NAME}."
+            echo "Runtime built from EDOS-Engineering/ork-meter $ORK_METER_REF ($runtime_commit)"
+            echo "with CGO_ENABLED=0 go build -trimpath -ldflags \"-s -w -buildid=\"."
+            echo
+            echo "SHA256 per target (also in runtime/<os>-<arch>/SHA256):"
+            for d in runtime/*/; do
+              echo "  ${d#runtime/}  $(cat "${d}SHA256")"
+            done
+            echo
+            echo "Dispatched-By: $DISPATCHER"
+            echo "Agent: package-runtime"
+            echo "Agent-Version: github-actions"
+            echo "Model: none"
+          } > "$RUNNER_TEMP/commit-message"
+          git commit -q -F "$RUNNER_TEMP/commit-message"
+          git show --stat --format=fuller HEAD
+          # A new branch only: no force, so an existing branch is never replaced.
+          git push origin "HEAD:refs/heads/$branch"
+          {
+            echo "## What and why"
+            echo
+            echo "Release of the Ork Meter plugin $PLUGIN_VERSION. One commit: runtime/ (five binaries and their SHA256 files) and the plugin.json version. Nothing else."
+            echo
+            echo "- plugin source: $source_commit (${GITHUB_REF_NAME})"
+            echo "- runtime: EDOS-Engineering/ork-meter $ORK_METER_REF ($runtime_commit)"
+            echo "- workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo
+            echo "| target | SHA256 |"
+            echo "|---|---|"
+            for d in runtime/*/; do
+              echo "| ${d#runtime/} | \`$(cat "${d}SHA256")\` |"
+            done
+            echo
+            echo "This adds about 60 MB of binaries to main's history."
+            echo
+            echo "After this merges, a human whose SSH signing key is in .github/allowed_signers signs a tag on the merged commit on main (docs/release.md, \"Cutting a release\" and \"Signed release tags\"); publish-release refuses an unsigned tag:"
+            echo
+            echo "\`git tag -s v$PLUGIN_VERSION <merged-commit> -m \"Ork Meter plugin $PLUGIN_VERSION (runtime from ork-meter $ORK_METER_REF)\"\`"
+            echo
+            echo "Then dispatch the publish-release workflow from main with plugin_version $PLUGIN_VERSION to create the GitHub Release with the downloadable assets (docs/release.md, \"Publishing the GitHub Release\")."
+          } > "$RUNNER_TEMP/pr-body"
+          url=$(gh pr create --base main --head "$branch" \
+            --title "release: plugin $PLUGIN_VERSION with runtime from ork-meter $ORK_METER_REF" \
+            --body-file "$RUNNER_TEMP/pr-body")
+          {
+            echo "## Ork Meter plugin $PLUGIN_VERSION: release pull request opened"
+            echo
+            echo "- pull request: $url"
+            echo "- branch: \`$branch\` at $(git rev-parse HEAD)"
+            echo "- plugin source: $source_commit (${GITHUB_REF_NAME})"
+            echo "- runtime: ork-meter $ORK_METER_REF ($runtime_commit)"
+            echo "- next: review and merge it through the merge queue, sign a tag \`v$PLUGIN_VERSION\` on the merged commit (\`git tag -s\`), then dispatch publish-release for the GitHub Release (docs/release.md)"
+            echo
+            echo "| target | SHA256 |"
+            echo "|---|---|"
+            for d in runtime/*/; do
+              echo "| ${d#runtime/} | \`$(cat "${d}SHA256")\` |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,7 @@
+# The hooks' optional tokenizer: direct requirements, each an exact pin.
+# requirements-hooks.txt locks these and everything they need, with hashes;
+# after editing this file run: python3 .github/scripts/lock-hook-requirements.py
+tiktoken==0.14.0
+# Security pin: certifi before 2026.10.19 bundles emSign roots with
+# compromised intermediate CA keys (GHSA-6q48-6c7w-9gw2).
+certifi==2026.10.19

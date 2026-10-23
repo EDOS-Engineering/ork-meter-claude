@@ -1,0 +1,12 @@
+{
+  "contract": "ork-evidence-behavior",
+  "version": 1,
+  "fixtures_sha256": "dde51b78ce3627bc549b463e0ad7139246649edbe53f8c9017e79ca0bafb52fe",
+  "shared_modules": {
+    "evidence_formats": {
+      "claude": "hooks/lib/evidence_formats.py",
+      "codex": "ork_codex/evidence_formats.py",
+      "sha256": "f9985ff335a861876b57c7222d21be9837708c6c860fd8ca80d93fd3c756b0ba"
+    }
+  }
+}

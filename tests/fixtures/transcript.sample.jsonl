@@ -1,0 +1,6 @@
+{"message": {"content": "hi", "role": "user"}, "type": "user", "uuid": "u1"}
+{"message": {"content": [{"text": "x", "type": "text"}], "id": "msg_1", "role": "assistant", "usage": {"cache_creation_input_tokens": 200, "cache_read_input_tokens": 1000, "input_tokens": 10, "output_tokens": 50}}, "requestId": "req_1", "type": "assistant", "uuid": "a1"}
+{"message": {"content": [{"type": "tool_use"}], "id": "msg_1", "role": "assistant", "usage": {"cache_creation_input_tokens": 200, "cache_read_input_tokens": 1000, "input_tokens": 10, "output_tokens": 50}}, "requestId": "req_1", "type": "assistant", "uuid": "a2"}
+{"message": {"content": [{"text": "y", "type": "text"}], "id": "msg_2", "role": "assistant", "usage": {"cache_creation_input_tokens": 0, "cache_read_input_tokens": 2000, "input_tokens": 5, "output_tokens": 25}}, "requestId": "req_2", "type": "assistant", "uuid": "a3"}
+{"message": {"content": [{"text": "z", "type": "text"}], "id": "msg_3", "role": "assistant"}, "requestId": "req_3", "type": "assistant", "uuid": "a4"}
+{"type": "attachment", "uuid": "t1"}

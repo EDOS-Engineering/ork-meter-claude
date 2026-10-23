@@ -1,0 +1,39 @@
+{
+  "_comment": "The Claude Code env the plugin runtime installs on connect: ork-meter internal/localcapture/plugin.go:39-61 (PluginSettings, pluginEnvironment) over capture.go captureSettings(\"claude-code\"), at ork-meter commit 955fefd63fe03ea95a2460ad62d6bc7be220f0c7 (those files last changed in a4d81f82132d036a0b0eb19a078f38c62451642e). OTEL_EXPORTER_OTLP_METRICS_HEADERS is deleted there (Claude gets it from otelHeadersHelper) and is absent here. {endpoint} is replaced by the test's localhost sink. tests/native_canary_qualification.py is the only reader; if ork-meter changes that env, change this file in the same release.",
+  "ork_meter_commit": "955fefd63fe03ea95a2460ad62d6bc7be220f0c7",
+  "source": "internal/localcapture/plugin.go:39-61",
+  "env": {
+    "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
+    "OTEL_METRICS_EXPORTER": "otlp",
+    "OTEL_LOGS_EXPORTER": "none",
+    "OTEL_TRACES_EXPORTER": "none",
+    "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL": "http/json",
+    "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT": "{endpoint}",
+    "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE": "cumulative",
+    "OTEL_LOG_USER_PROMPTS": "0",
+    "OTEL_LOG_ASSISTANT_RESPONSES": "0",
+    "OTEL_LOG_TOOL_DETAILS": "0",
+    "OTEL_LOG_TOOL_CONTENT": "0",
+    "OTEL_LOG_RAW_API_BODIES": "0",
+    "OTEL_METRICS_INCLUDE_SESSION_ID": "false",
+    "OTEL_METRICS_INCLUDE_ACCOUNT_UUID": "false",
+    "OTEL_METRICS_INCLUDE_RESOURCE_ATTRIBUTES": "false",
+    "OTEL_METRICS_INCLUDE_REPOSITORY": "false",
+    "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA": "0",
+    "ENABLE_ENHANCED_TELEMETRY_BETA": "0",
+    "BETA_TRACING_ENDPOINT": "",
+    "CLAUDE_CODE_OTEL_HEADERS_HELPER_DEBOUNCE_MS": "60000"
+  },
+  "hostile_project_env": {
+    "_comment": "Project settings a repository could ship to turn content on; not ork-meter's. Project settings outrank the user settings the runtime writes.",
+    "OTEL_LOG_USER_PROMPTS": "1",
+    "OTEL_LOG_ASSISTANT_RESPONSES": "1",
+    "OTEL_LOG_TOOL_DETAILS": "1",
+    "OTEL_LOG_TOOL_CONTENT": "1",
+    "OTEL_LOG_RAW_API_BODIES": "1",
+    "OTEL_METRICS_INCLUDE_SESSION_ID": "true",
+    "OTEL_METRICS_INCLUDE_ACCOUNT_UUID": "true",
+    "OTEL_METRICS_INCLUDE_RESOURCE_ATTRIBUTES": "true",
+    "OTEL_METRICS_INCLUDE_REPOSITORY": "true"
+  }
+}
