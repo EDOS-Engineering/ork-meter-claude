@@ -72,6 +72,10 @@ RUNTIME_CANDIDATES = {
         "linux-amd64": "78b7ea65393a7749b346660fde851c23f278d30712501e13f95c924907e5f44b",
         "linux-arm64": "3b8bc82ee059568ae7fc7a2b06aba964122be6ba6d48b45e0af38696e5431a42",
     }),
+    "0.5.4": ("c1e659ace905e99bbe2de0aeb34df7209b0e1b09", {
+        "linux-amd64": "d1853283ef75d62b50cb01b622f23fc70de9399c11f9c0b113378244551f395f",
+        "linux-arm64": "41c4fb999bd9a7a3bb506c1bd1ff0844e7343195ed686e29427ee7b05d975d74",
+    }),
 }
 # A -dev version on main ships the last release's runtime until the next release PR replaces runtime/.
 RUNTIME_CANDIDATES["0.5.4-dev"] = RUNTIME_CANDIDATES["0.5.3"]
