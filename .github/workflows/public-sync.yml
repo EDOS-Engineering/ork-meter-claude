@@ -1,0 +1,146 @@
+name: public-sync
+
+# Proposes a released version of the private development repository,
+# EDOS-Engineering/claude-plugin, as a pull request here. It runs only by hand,
+# after the private release is tagged and published. It checks out the private
+# repository at its signed tag v<version> with the read-only
+# ORK_METER_READ_TOKEN, verifies the tag with this repository's tag check and
+# allowed signers (from main), runs that tag's scripts/sync_public.py against
+# this repository's main (the private manifest decides what is mirrored, what
+# this repository owns and what must never leave the private repository; any
+# leak refuses the run), validates the plugin and runs the tests, then pushes
+# sync/<version> and opens "sync: <version> from <private sha>" with this
+# repository's own GITHUB_TOKEN. It never pushes to main, never tags and never
+# publishes: the release here (package-runtime, then publish-release) follows
+# after a human merges the sync pull request (docs/release.md). Nothing here
+# runs on push.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Released plugin version to propose (the private tag v<version> must exist and be signed).
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: public-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      VERSION: ${{ inputs.version }}
+      PRIVATE_REPOSITORY: EDOS-Engineering/claude-plugin
+    steps:
+      - name: Refuse a malformed version
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::version must be semver, got $VERSION"; exit 1; }
+      - name: Check out main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          path: public
+          persist-credentials: true
+      - name: Check out the released private tree
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.PRIVATE_REPOSITORY }}
+          ref: refs/tags/v${{ inputs.version }}
+          path: private
+          fetch-depth: 0
+          token: ${{ secrets.ORK_METER_READ_TOKEN }} # read-only; see docs/release.md
+          persist-credentials: false
+      # Main's tag check and allowed signers: the tag's own tree cannot vouch
+      # for its own signature.
+      - name: Verify the signed tag and the plugin version
+        working-directory: private
+        run: |
+          set -euo pipefail
+          python3 -I -B ../public/.github/scripts/check-tag-signature.py --tag "v$VERSION" --commit "$(git rev-parse HEAD)" \
+            --allowed-signers ../public/.github/allowed_signers
+          actual=$(python3 -I -c 'import json; print(json.load(open(".claude-plugin/plugin.json"))["version"])')
+          [ "$actual" = "$VERSION" ] || { echo "::error::plugin.json at v$VERSION says $actual"; exit 1; }
+          test -f scripts/sync_public.py || { echo "::error::v$VERSION has no scripts/sync_public.py"; exit 1; }
+          echo "PRIVATE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+      - name: Sync (refuses any private leak)
+        run: |
+          set -euo pipefail
+          python3 -I -B private/scripts/sync_public.py --public public --report "$RUNNER_TEMP/sync.json"
+          if [ -z "$(git -C public status --porcelain --untracked-files=all)" ]; then
+            echo "::notice::main already matches v$VERSION; nothing to propose"
+            echo "NOTHING_TO_SYNC=1" >> "$GITHUB_ENV"
+          fi
+      - name: Drop the private checkout
+        run: rm -rf private
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: env.NOTHING_TO_SYNC != '1'
+        with:
+          node-version: 22
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        if: env.NOTHING_TO_SYNC != '1'
+        with:
+          python-version: "3.10"
+      - name: Install the pinned hook tokenizer
+        if: env.NOTHING_TO_SYNC != '1'
+        working-directory: public
+        run: |
+          python -m pip install --require-hashes --only-binary=:all: -r requirements-hooks.txt
+      - name: Install Claude Code for plugin validation
+        if: env.NOTHING_TO_SYNC != '1'
+        uses: ./public/.github/actions/install-claude
+        with:
+          version: latest
+      - name: Validate and test the synced tree
+        if: env.NOTHING_TO_SYNC != '1'
+        working-directory: public
+        run: |
+          set -euo pipefail
+          claude plugin validate --strict .claude-plugin/plugin.json
+          claude plugin validate --strict .claude-plugin/marketplace.json
+          bash tests/run.sh
+      - name: Open the sync pull request
+        if: env.NOTHING_TO_SYNC != '1'
+        working-directory: public
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DISPATCHER: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          branch="sync/$VERSION"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git add -A
+          git commit -q -F - <<EOF
+          sync: $VERSION from ${PRIVATE_SHA:0:12}
+
+          Forward-synced from the private release v$VERSION by public-sync.
+
+          Dispatched-By: $DISPATCHER
+          Agent: public-sync
+          Agent-Version: github-actions
+          Model: none
+          EOF
+          # A new branch only: never main, never a tag.
+          git push origin "HEAD:refs/heads/$branch"
+          {
+            echo "Forward sync of the private release **v$VERSION** (private commit \`$PRIVATE_SHA\`)."
+            echo
+            echo "Changed paths:"
+            python3 -I -c 'import json,sys; [print("- " + c["kind"] + ": \`" + c["path"] + "\`") for c in json.load(open(sys.argv[1]))["changed"]]' "$RUNNER_TEMP/sync.json"
+            echo
+            echo "Validated with \`claude plugin validate --strict\` and \`tests/run.sh\` in ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}."
+            echo
+            echo "After merge, cut the release here (docs/release.md)."
+          } > "$RUNNER_TEMP/pr-body"
+          gh pr create --base main --head "$branch" \
+            --title "sync: $VERSION from ${PRIVATE_SHA:0:12}" --body-file "$RUNNER_TEMP/pr-body"

@@ -87,6 +87,30 @@ with the same plugin tree as a zip, each runtime binary, an SPDX SBOM, a
 ("Publishing the GitHub Release", "SBOM"). It is the downloadable, verifiable form of the release, not a
 second install channel: the marketplace install above is what customers use.
 
+## Syncing from development
+
+Development happens in the private repository EDOS-Engineering/claude-plugin.
+Each version reaches this repository as a pull request before it is released
+here:
+
+1. The private release is cut and its tag `v<version>` is signed there.
+2. A human dispatches this repository's **public-sync** workflow
+   (`.github/workflows/public-sync.yml`) with `version`. It checks out the
+   private repository at `v<version>` with `ORK_METER_READ_TOKEN` (read-only,
+   `persist-credentials: false`), verifies the tag with main's
+   `check-tag-signature.py` and `allowed_signers`, and runs that tag's
+   `scripts/sync_public.py`. The private manifest decides which paths are
+   mirrored, which this repository owns (LICENSE, README, SECURITY,
+   CONTRIBUTING, notices, the ruleset, this file, the release workflows,
+   `runtime/` and the marketplace pin are never touched) and which must never
+   leave the private repository; any leak pattern refuses the whole run before
+   a write. It then validates the plugin, runs `tests/run.sh`, pushes
+   `sync/<version>` and opens **sync: &lt;version&gt; from &lt;private sha&gt;**
+   with the workflow's own `GITHUB_TOKEN`. It never pushes to `main`, never
+   tags and never publishes. If `main` already matches, it stops with a notice.
+3. A human reviews and merges the sync pull request.
+4. The release below is cut from the merged `main`.
+
 ## Cutting a release
 
 Releases are cut by the `package-runtime` workflow
@@ -395,11 +419,14 @@ organization owner creates one of:
   start of the run.
 
 Store it as the organization secret **`ORK_METER_READ_TOKEN`**, available to
-`EDOS-Engineering/ork-meter-claude`.
-The token is used only by the `actions/checkout` step for ork-meter with
+`EDOS-Engineering/ork-meter-claude`. public-sync also reads
+`EDOS-Engineering/claude-plugin` with it ("Syncing from development"), so its
+repository access must include that repository too, still Contents:
+Read-only.
+The token is used only by `actions/checkout` steps with
 `persist-credentials: false`, so it is not written into the checkout's git
 config. Set an expiry and rotate it; a missing or expired token fails the
-ork-meter checkout step and nothing is published.
+checkout step and nothing is published or proposed.
 
 The push of `package-runtime/v<version>` and the pull request use the
 workflow's own `GITHUB_TOKEN`, with `contents: write` (for that branch) and
