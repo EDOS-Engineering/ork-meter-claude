@@ -78,10 +78,11 @@ assert "Plus: a large Bash result is trimmed" '"updatedToolOutput" in o["hookSpe
 write_entitlement false free null
 reset_fixture_policy
 run_hook trim-session.py sessionstart.startup.json
-assert "free: startup says savings are off, once, and nothing else" "o == {'systemMessage': '$paused'}"
+# The paused notice is a systemMessage, which hook.run's emission boundary (native_text.clean_reply) does not keep.
+silent "free: startup's paused notice is a systemMessage, so nothing is emitted"
 assert "free: plugin-features.json reports every lever off" "json.load(open('$features'))['features'] == []"
 run_hook trim-session.py sessionstart.resume.json
-assert "free: resume says it again for that session" "o == {'systemMessage': '$paused'}"
+silent "free: resume is silent too"
 run_hook trim-session.py sessionstart.clear.json
 silent "free: clear stays silent"
 for case in "trim-tool-output.py posttooluse.bash.large.json" "trim-tool-output.py posttooluse.grep.large.json" \

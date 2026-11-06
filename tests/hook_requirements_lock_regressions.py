@@ -133,7 +133,12 @@ class Installs(unittest.TestCase):
                 self.assertNotRegex(text, r"pip install[^\n]*requirements-hooks\.in")
 
     def test_customer_and_contributor_instructions_require_hashes(self):
-        for path in ("docs/token-optimization.md", "CONTRIBUTING.md", "hooks/lib/tokenizer_check.py"):
+        # The benchmark harness is development-only and absent from the public
+        # mirror, so it is checked only where it exists.
+        benchmark = "/".join(("benchmarks", "scripts", "coding_benchmark.py"))
+        paths = ["docs/token-optimization.md", "CONTRIBUTING.md", "hooks/lib/tokenizer_check.py"]
+        paths += [benchmark] if (ROOT / benchmark).is_file() else []
+        for path in paths:
             text = (ROOT / path).read_text(encoding="utf-8")
             installs = re.findall(r"pip install[^\n]*(?:\n[^\n]*)?requirements-hooks\.txt", text)
             installs += re.findall(r"pip install %s -r", text)

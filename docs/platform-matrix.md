@@ -134,7 +134,7 @@ Git Bash's.
 Linux install with the `linux-amd64` runtime, and the CI row above covers its
 hooks. Notes:
 
-- Keep projects and `~/.claude` in the Linux filesystem. Under a Windows drive mount (`/mnt/<drive>`) file
+- Keep projects and `~/.claude` in the Linux filesystem. Under `/mnt/c` file
   modes are Windows', so the owner-only checks on the bytecode cache and the
   session store fall back (no cache) and everything is slower. CI clones into
   the distribution for this reason.
@@ -173,8 +173,8 @@ marketplace on Linux or Windows, and production (`orkmeter.com`).
 
 ## Release checklist
 
-Before the human who merges the marketplace pointer for a release
-([release.md](release.md), "Cutting a release", step 13) merges it:
+Before the human who delivers a release to orkmeter.com
+([release.md](release.md), "Cutting a release", step 14) delivers it:
 
 1. Confirm the last nightly `ci` run on `main` passed every row above (it
    runs every `native-host` leg, `wsl` and `unit (ubuntu-24.04-arm)`).

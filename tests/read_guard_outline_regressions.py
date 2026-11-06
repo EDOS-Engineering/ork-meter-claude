@@ -68,8 +68,11 @@ class Outline(unittest.TestCase):
         with patch.object(guard, "count_lines", count_lines):
             return run_hook(payload, handle, guard.EVENTS, budget=hook.DEFAULT_BUDGET, started=time.monotonic())
 
-    def context(self, reply):
-        return (reply or {}).get("hookSpecificOutput", {}).get("additionalContext", "")
+    def limit(self, reply):
+        """The page the guard asked for. The outline itself was additionalContext, which the
+        emission boundary drops (hooks/lib/native_text.py clean_reply); whether it was built
+        still shows in the page length: OUTLINE_LIMIT with an outline, the plain page without."""
+        return (reply or {}).get("hookSpecificOutput", {}).get("updatedInput", {}).get("limit")
 
     # A runner that stalled: under 0.2 s of the budget left when read-guard
     # reaches the outline, as in the Windows failures (the page itself still
@@ -80,14 +83,14 @@ class Outline(unittest.TestCase):
         path = comment_heavy(self.root / "large.py")
         self.assertLessEqual(guard.code_bytes(path.read_bytes()), guard.CHEAP_CODE_BYTES)
         reply = self.invoke(path, left=self.ALMOST_SPENT)
-        self.assertIn("Python AST outline", self.context(reply), "a slow runner must not lose the outline")
-        self.assertIn("distant", self.context(reply))
+        self.assertEqual(self.limit(reply), guard.OUTLINE_LIMIT, "a slow runner must not lose the outline")
+        self.assertNotIn("additionalContext", reply["hookSpecificOutput"])
 
     def test_code_heavy_module_needs_time_left(self):
         path = code_heavy(self.root / "big.py")
         self.assertGreater(guard.code_bytes(path.read_bytes()), guard.CHEAP_CODE_BYTES)
-        self.assertNotIn("Python AST outline", self.context(self.invoke(path, left=self.ALMOST_SPENT)))
-        self.assertIn("Python AST outline", self.context(self.invoke(path)))
+        self.assertEqual(self.limit(self.invoke(path, left=self.ALMOST_SPENT)), 300, "the plain page, no outline")
+        self.assertEqual(self.limit(self.invoke(path)), guard.OUTLINE_LIMIT)
 
     def test_code_bytes_ignores_blank_and_comment_lines(self):
         self.assertEqual(guard.code_bytes(b"# c\n\n   # indented\nx = 1\n  y = 2\n"), len(b"x = 1") + len(b"  y = 2"))

@@ -87,13 +87,21 @@ class NativeWebFetch(unittest.TestCase):
             for kept in ("summary_line_0000", "summary_line_0343", "ERROR: webfetch-middle diagnostic"):
                 self.assertIn(kept, visible)
             self.assertNotIn("summary_line_0200 ", visible)
-            self.assertIn("[Ork Meter trimmed ", visible)
-            marker = visible.rsplit("Full output: ", 1)[1].split(" (", 1)[0]
-            self.assertEqual(Path(marker).read_text(encoding="utf-8"), text,
+            # The "… [Ork Meter trimmed …]" marker and the "Full output:" note are not
+            # received lines, so native_text.source_output drops them: the model gets the
+            # kept lines alone, and the whole result is in the session's snapshot.
+            self.assertNotIn("Ork Meter", visible)
+            self.assertNotIn("Full output:", visible)
+            [store] = host.stores().values()
+            [snapshot] = Path(store.tool_output_dir()).glob("*.txt")
+            self.assertEqual(snapshot.read_text(encoding="utf-8"), text,
                              "the full-output file must hold the host's whole result")
             self.assertEqual([(row["kind"], row["tool"], row.get("tool_call_sha256")) for row in rows],
                              [("trim", "WebFetch", call_sha(identifier))])
             self.assertEqual(rows[0]["bytes_before"], len(text.encode()))
+            # Charged for the emitted text (native_text.reconcile_records), not the noted one.
+            self.assertTrue(rows[0].get("native_text_boundary_reconciled"))
+            self.assertLess(rows[0]["bytes_after"], rows[0]["bytes_before"])
             return visible
 
 

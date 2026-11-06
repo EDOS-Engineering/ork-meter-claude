@@ -91,7 +91,17 @@ def main(argv):
     except Exception:
         off = False
     if off:
-        sys.stdin.buffer.read()   # take the payload, as a hook that ran would
+        raw = sys.stdin.buffer.read()
+        try:
+            import json
+            from hook_telemetry import Invocation
+            payload = json.loads(raw)
+            if isinstance(payload, dict):
+                entry = Invocation(os.path.basename(script), payload, STARTED)
+                entry.row['reason'] = 'early-feature-opt-out'
+                entry.finish()
+        except Exception:
+            pass
         return
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import hook  # noqa: E402
@@ -104,7 +114,7 @@ def main(argv):
              feature=getattr(module, "FEATURE", None),
              budget=getattr(module, "BUDGET", hook.DEFAULT_BUDGET), reducer=getattr(module, "REDUCER", None),
              wanted=getattr(module, "wanted", None), started=STARTED, every_mode=getattr(module, "EVERY_MODE", False),
-             launch_age=hook.launch_age(LAUNCHED_AT, STARTED_WALL))
+             launch_age=hook.launch_age(LAUNCHED_AT, STARTED_WALL), hook_name=os.path.basename(script))
 
 
 if __name__ == "__main__":

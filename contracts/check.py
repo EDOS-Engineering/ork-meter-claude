@@ -84,7 +84,10 @@ class Claude:
             ctx.record(self.ledger.trimmed("Bash", case["before"], case["after"]))
             if case["phase"] == "abandoned":
                 return None
-            return self.hook.updated_tool_output("PostToolUse", dict(payload["tool_response"], stdout="x" * case["after"]))
+            # The emission boundary (native_text.source_output) keeps only received lines; a
+            # trimmed long line is emitted as its prefix plus the trimmer's cap marker.
+            capped = "x" * case["after"] + "\u2026 [+%d chars]" % (case["before"] - case["after"])
+            return self.hook.updated_tool_output("PostToolUse", dict(payload["tool_response"], stdout=capped))
         sink = io.StringIO()
         with patch.object(sys, "stdin", io.StringIO(json.dumps(payload))), patch.object(sys, "stdout", sink):
             if case["phase"] == "write_failed":

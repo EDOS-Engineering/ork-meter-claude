@@ -27,9 +27,10 @@ REF, ORIGIN = "fff8bc443e61f3d6b4e78c55eff5ba01", "https://plus-policy-test.inva
 NOW = calendar.timegm((2026, 10, 21, 20, 30, 0))
 fx = lambda name: open(os.path.join(F, name + ".json"), "rb").read()
 v = plus_policy.verify(fx("claude-code-entitled"), "claude-code", REF, ORIGIN, NOW)
-assert v["policy"]["id"] == "claude-code-defaults-2026-10-22" and plus_policy.entitled(v, NOW)
+assert v["policy"]["id"] == "claude-code-defaults-2026-10-26" and plus_policy.entitled(v, NOW)
 assert v["entitlement"]["state"] == "promo" and v["audience"] == REF and v["issuer"] == ORIGIN
-assert set(v["policy"]["levers"]) == set(features.LEVERS), "the contract policy names every lever in LEVERS"
+# The contract policy (2026-10-26) also names "polling", a lever d421a74 took out of features.LEVERS; unknown policy levers are ignored (features.enabled_features).
+assert set(features.LEVERS) <= set(v["policy"]["levers"]), "the contract policy names every lever in LEVERS"
 assert all(flag is True for flag in v["policy"]["levers"].values()), "and leaves none off (the opt-ins still need their switch)"
 known = {"%s.%s" % (lever, key) for lever, spec in features.LEVERS.items() for key in spec["tunables"]}
 assert set(v["policy"]["tunables"]) <= known, set(v["policy"]["tunables"]) - known
@@ -74,9 +75,11 @@ NOW = calendar.timegm((2026, 10, 21, 20, 30, 0))
 v = plus_policy.verify(signer.envelope(now=NOW), "claude-code", signer.REFERENCE, signer.ORIGIN, NOW)
 assert v["policy"] == signer.DEFAULT_POLICY and plus_policy.entitled(v, NOW)
 issued = calendar.timegm((2026, 10, 21, 20, 0, 0))
-ours = signer.payload(state="promo", until="2026-10-31T23:59:59Z", checked_at="2026-10-21T20:00:00Z", issued_at=issued)
 fixture = json.loads(open(os.path.join(F, "claude-code-entitled.json"), "rb").read())
-assert json.dumps(ours, sort_keys=True, separators=(",", ":")) == base64.urlsafe_b64decode(fixture["payload"] + "==").decode(), "the same document"
+document = base64.urlsafe_b64decode(fixture["payload"] + "==").decode()
+# The fixture carries the contract policy 2026-10-26 (with "polling"); signer.DEFAULT_POLICY is d421a74 (2026-10-22, no polling), so the fixture policy is passed in.
+ours = signer.payload(state="promo", until="2026-10-31T23:59:59Z", checked_at="2026-10-21T20:00:00Z", issued_at=issued, policy=json.loads(document)["policy"])
+assert json.dumps(ours, sort_keys=True, separators=(",", ":")) == document, "the same document"
 ' \
   "entitlement: a valid envelope with its connection.json entitles; audience, origin, tampering, plugin, freshness and a missing connection.json do not" '
 import calendar, json, os, shutil, sys, tempfile
@@ -100,7 +103,7 @@ assert e.resolve(env, NOW) == (e.NOT_CONNECTED, None), "nothing at all"
 connection(); assert e.resolve(env, NOW) == (e.NOT_CONNECTED, None), "paired, no answer cached yet"
 shutil.copy(os.path.join(F, "claude-code-entitled.json"), P); os.chmod(P, 0o600)
 state, policy = e.resolve(env, NOW)
-assert state == e.ENTITLED and policy["id"] == "claude-code-defaults-2026-10-22" and policy["levers"]["trim"] is True
+assert state == e.ENTITLED and policy["id"] == "claude-code-defaults-2026-10-26" and policy["levers"]["trim"] is True
 assert e.status(env, NOW) == e.ENTITLED and e.policy(env, NOW) == policy
 assert e.status(env, calendar.timegm((2026, 11, 1, 23, 59, 59))) == e.NOT_ENTITLED, "the envelope itself expires before until does"
 assert e.status(env, NOW - 3600) == e.NOT_ENTITLED, "issued in the future"
@@ -257,11 +260,34 @@ assert features.gate(env, entitlement.LEGACY_UNTIL).entitlement == entitlement.N
 '
 
 features_file="$XDG_STATE_HOME/ork-meter/plugin-features.json"
-# End to end. The lib.sh default is the contract's claude-code policy: every lever named, the opt-ins still off without their switch.
+# The status line is built but stripped with every systemMessage at the emission boundary
+# (hooks/lib/native_text.py clean_reply): SessionStart is silent, and the policy in force is read
+# back from the session pin the hook wrote, as the hook computes it (features.status_line).
+pinned_status() { # [VAR=value ...]: the status line for the pinned session policy
+  env "$@" python3 -I -c 'import os, sys
+sys.path.insert(0, "hooks/lib")
+import features, policy, session
+store = session.Store.for_scratchpad(os.environ["SCRATCH"])
+gated = features.gate(dict(os.environ))
+print(features.status_line(features.carried(policy.for_store(store, gated), gated)))'
+}
+status_is() { # <name> <python expression over `s`> [VAR=value ...]
+  local name=$1 expr=$2 s
+  shift 2
+  s=$(pinned_status "$@")
+  if S="$s" python3 -c 'import os, sys; s = os.environ["S"]; sys.exit(0 if eval(sys.argv[1]) else 1)' "$expr"; then
+    echo "  ok   $name"
+  else
+    echo "  FAIL $name: $expr"; echo "       pinned: $s"; fails=$((fails + 1)); return 1
+  fi
+}
+# End to end. The lib.sh default is the signer's claude-code policy (tests/plus_policy_sign.py DEFAULT_POLICY,
+# 2026-10-22 since d421a74): every lever named, the opt-ins still off without their switch.
 reset_fixture_policy
 run_hook trim-session.py sessionstart.startup.json
-assert "contract policy: the status line names it" 'o["systemMessage"] == "Ork Meter trim: on (Bash 12K, Read 24K, Grep 8K, Glob 4K, WebFetch 16K; read guard 96K). Policy claude-code-defaults-2026-10-22."'
-assert "contract policy: plugin-features.json lists every lever but the opt-ins" "json.load(open('$features_file'))['features'] == ['audit', 'cache_nudge', 'dedupe', 'loop_guard', 'read_guard', 'test_filter', 'trim']"
+silent "contract policy: SessionStart is silent (the status line is stripped at the boundary)"
+status_is "contract policy: the pinned status line names it" 's == "Ork Meter trim: on (Bash 12K, Read 24K, Grep 8K, Glob 4K, WebFetch 16K; read guard 96K). Policy claude-code-defaults-2026-10-22."'
+assert "contract policy: plugin-features.json lists every lever but the opt-ins" "json.load(open('$features_file'))['features'] == sorted(['audit', 'cache_nudge', 'dedupe', 'loop_guard', 'read_guard', 'test_filter', 'trim'] )"
 run_hook trim-tool-output.py posttooluse.bash.large.json
 assert "contract policy: a large Bash result is trimmed" '"updatedToolOutput" in o["hookSpecificOutput"]'
 
@@ -271,7 +297,8 @@ policy='{"id":"no-trim-2026","levers":{"loop_guard":true,"dedupe":true},"tunable
 write_entitlement true active '"2099-01-01T00:00:00Z"' "$policy"
 reset_fixture_policy
 run_hook trim-session.py sessionstart.startup.json
-assert "trim off by policy: the status line says which policy" 'o["systemMessage"] == "Ork Meter trim: off (policy no-trim-2026)."'
+silent "trim off by policy: SessionStart is silent"
+status_is "trim off by policy: the pinned status line says which policy" 's == "Ork Meter trim: off (policy no-trim-2026)."'
 run_hook trim-tool-output.py posttooluse.bash.large.json
 silent "trim off by policy: a large Bash result passes through untouched"
 run_hook trim-tool-output.py posttooluse.bash.large.json ORK_METER_TRIM=on ORK_METER_MODE=reduce
@@ -287,14 +314,16 @@ policy='{"id":"wide-bash-2026","levers":{"trim":true,"read_guard":true},"tunable
 write_entitlement true active '"2099-01-01T00:00:00Z"' "$policy"
 reset_fixture_policy
 run_hook trim-session.py sessionstart.startup.json
-assert "policy tunables: the status line shows them (clamped to the lever's grammar)" 'o["systemMessage"] == "Ork Meter trim: on (Bash 64K, Read 24K, Grep 8K, Glob 4K, WebFetch 16K; read guard 195K). Policy wide-bash-2026."'
+silent "policy tunables: SessionStart is silent"
+status_is "policy tunables: the pin carries them (clamped to the lever's grammar)" 's == "Ork Meter trim: on (Bash 64K, Read 24K, Grep 8K, Glob 4K, WebFetch 16K; read guard 195K). Policy wide-bash-2026."'
 run_hook trim-tool-output.py posttooluse.bash.large.json
 silent "policy tunables: a 20 KiB Bash result is under the policy's 64 KiB budget"
 run_hook trim-tool-output.py posttooluse.grep.large.json
 assert "policy tunables: an unlisted budget keeps its built-in default" '"updatedToolOutput" in o["hookSpecificOutput"]'
 reset_fixture_policy
 run_hook trim-session.py sessionstart.startup.json ORK_METER_TRIM_BUDGET_BASH=8k
-assert "an explicit env value still wins over the policy default" 'o["systemMessage"].startswith("Ork Meter trim: on (Bash 8K, ")'
+silent "an explicit env value: SessionStart is silent"
+status_is "an explicit env value still wins over the policy default" 's.startswith("Ork Meter trim: on (Bash 8K, ")'
 run_hook trim-tool-output.py posttooluse.bash.large.json ORK_METER_TRIM_BUDGET_BASH=8k
 assert "and the pinned env value trims" '"updatedToolOutput" in o["hookSpecificOutput"]'
 
@@ -317,6 +346,9 @@ silent "disconnected: passes through"
 # No file outside features.py, entitlement.py's own files aside, reads the policy files or ORK_METER_* (tests/features.test.sh checks the latter).
 if python3 - <<'EOF'
 import os, re
+# hooks/session-start.sh only tests that connection.json exists (connected
+# or not, for first-run connect), once, and never reads it.
+allowed = {("hooks/session-start.sh", '[ -f "${CLAUDE_PLUGIN_DATA:-}/connection.json" ]')}
 offenders = []
 for d in ("hooks", "hooks/lib", "scripts"):
     for f in sorted(os.listdir(d)):
@@ -325,7 +357,9 @@ for d in ("hooks", "hooks/lib", "scripts"):
             continue
         src = open(p, encoding="utf-8").read()
         for m in re.finditer(r"plus-policy\.json|connection\.json|plus_policy\.verify", src):
-            offenders.append((p, src[:m.start()].count("\n") + 1, m.group(0)))
+            line = src.splitlines()[src[:m.start()].count("\n")]
+            if not any(p == path and text in line and src.count("connection.json") == 1 for path, text in allowed):
+                offenders.append((p, src[:m.start()].count("\n") + 1, m.group(0)))
 assert not offenders, offenders
 EOF
 then echo "  ok   only hooks/lib/entitlement.py reads the policy files"; else echo "  FAIL the policy files are read outside entitlement.py"; fails=$((fails + 1)); fi

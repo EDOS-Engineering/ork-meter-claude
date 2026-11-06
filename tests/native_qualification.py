@@ -13,6 +13,8 @@ import plus_policy_sign  # noqa: E402
 from native_host import Fixture, Host, hook_evidence, latest_tool_delivery  # noqa: E402
 from native_cache_qualification import history  # noqa: E402
 sys.path.insert(0, str(ROOT / "hooks/lib"))
+import ledger  # noqa: E402
+import read_tool  # noqa: E402
 import session  # noqa: E402
 
 
@@ -80,36 +82,66 @@ class NativeQualification(unittest.TestCase):
             self.assertEqual(len(Fixture.requests), 3)
             first = latest_tool_delivery(Fixture.requests[1])
             second = latest_tool_delivery(Fixture.requests[2])
+            # No plugin prose reaches the model (hooks/lib/native_text.py clean_reply drops
+            # additionalContext; source_output keeps only received lines): the evidence of a
+            # reduction is the received-only text plus the ledger rows of this session's store.
             if ast_file:
                 delivered = json.dumps(first)
-                if mode == "reduce":   # Read compaction is opt-in (#316): the guard outlines as before
-                    self.assertIn("Python AST outline", delivered)
+                self.assertNotIn("Python AST outline", delivered)
+                if mode == "reduce":   # Read compaction is opt-in (#316): the guard pages as before
+                    # The guard's updatedInput survives the boundary (limit=OUTLINE_LIMIT lines);
+                    # the outline it used to add as additionalContext does not, so the distant
+                    # symbol is no longer in the delivery: the read_guard ledger row is the evidence.
+                    self.assertIn("# line %d " % (read_tool.OUTLINE_LIMIT - 3), delivered)
+                    self.assertNotIn("# line %d " % (read_tool.OUTLINE_LIMIT - 2), delivered)
                     self.assertNotIn("# line 340", delivered)
-                else:
-                    self.assertNotIn("Python AST outline", delivered)
-                    self.assertIn("# line 340", delivered)
-                if mode == "off" and ast_lines > 1000:
-                    self.assertIn("[Truncated: PARTIAL view", delivered)
                     self.assertNotIn("distant", delivered)
+                    [store] = host.stores().values()
+                    guarded = [row for row in ledger.load(store) if row["kind"] == "read_guard"]
+                    self.assertEqual([row["path_sha256"] for row in guarded], [ledger.sha256_hex(paths[0])],
+                                     hook_evidence(result.stdout))
                 else:
-                    self.assertTrue("distant" in delivered, "AST map must expose the distant symbol")
+                    self.assertIn("# line 340", delivered)
+                    if ast_lines > 1000:
+                        self.assertIn("[Truncated: PARTIAL view", delivered)
+                        self.assertNotIn("distant", delivered)
+                    else:
+                        self.assertIn("distant", delivered)
             elif mode == "reduce":
-                self.assertIn("Ork Meter trimmed this Read", json.dumps(first), hook_evidence(result.stdout))
-                self.assertIn("Full original Read snapshot", json.dumps(first))
-                self.assertNotIn("evidence_0499", json.dumps(first))
+                # dedupe-reads' "Ork Meter trimmed this Read" note and the snapshot path are
+                # dropped at the boundary: the model gets the exact head lines, the full text
+                # is in the session's tool-output snapshot and the ledger holds the trim row.
+                delivered = json.dumps(first)
+                self.assertNotIn("evidence_0499", delivered, hook_evidence(result.stdout))
+                self.assertIn("evidence_0000 exact source context", delivered)
+                self.assertNotIn("Ork Meter", delivered)
+                [store] = host.stores().values()
+                # One snapshot per trimmed Read: the second, unranged Read is trimmed too
+                # under the pinned 1 KiB budget (mutate_defaults); the ranged one is not.
+                snapshots = list(Path(store.tool_output_dir()).glob("*.txt"))
+                self.assertEqual([path.read_text(encoding="utf-8") for path in snapshots],
+                                 [original] * (2 if mutate_defaults else 1))
+                row = [row for row in ledger.load(store) if row["kind"] == "trim"][0]
+                self.assertEqual((row["tool"], row.get("native_text_boundary_reconciled")), ("Read", True))
+                self.assertLess(row["bytes_after"], row["bytes_before"])
             else:
                 self.assertIn("evidence_0499", json.dumps(first))
-                self.assertNotIn("Ork Meter trimmed this Read", json.dumps(first))
                 traces = list(temporary_files.rglob("shadow-traces/*.json"))
                 self.assertTrue(traces, "installed hook must produce local observations")
                 observed = [json.loads(path.read_text()) for path in traces]
                 post = [item for item in observed if item["event"] == "PostToolUse"]
-                self.assertEqual(len(post), 2)
+                # Every PostToolUse hook on Read captures in shadow mode (hook.run), and
+                # polling-completion.py now matches Read as well as dedupe-reads.py: one
+                # observation per hook, so count the Reads observed, not the files.
+                self.assertEqual(len({item["tool_use_id"] for item in post}), 2)
+                self.assertEqual({item["tool_name"] for item in post}, {"Read"})
                 for item in post:
                     self.assertIn("evidence_0499", json.dumps(item["tool_response"]))
             if mutate_defaults:
-                self.assertIn("Ork Meter trimmed this Read", json.dumps(second))
+                # Still trimmed under the pinned 1 KiB budget: the head only, no note.
                 self.assertNotIn("evidence_0499", json.dumps(second))
+                self.assertIn("evidence_0000 exact source context", json.dumps(second))
+                self.assertNotIn("Ork Meter", json.dumps(second))
                 pins = list(temporary_files.rglob(session.POLICY_NAME))
                 self.assertEqual(len(pins), 1)
                 pin = json.loads(pins[0].read_text())
@@ -117,10 +149,12 @@ class NativeQualification(unittest.TestCase):
                 for path in temporary_files.rglob(session.LEDGER_NAME):
                     rows = [json.loads(line) for line in path.read_text().splitlines()]
                     self.assertTrue(rows)
+                    self.assertEqual([row["kind"] for row in rows], ["trim", "trim"])
                     self.assertTrue(all(row["policy_sha256"] == pin["policy_sha256"] for row in rows))
             else:
+                # An explicit range (limit=1000) is never shortened: the exact page arrives.
                 self.assertIn("evidence_0499", json.dumps(second))
-                self.assertNotIn("Ork Meter trimmed this Read", json.dumps(second))
+                self.assertNotIn("Ork Meter", json.dumps(second))
             earlier = Fixture.requests[1]["messages"]
             self.assertEqual(content_only(Fixture.requests[2]["messages"][:len(earlier)]), content_only(earlier),
                              "previously delivered context must remain unchanged")

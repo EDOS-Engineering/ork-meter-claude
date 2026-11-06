@@ -47,8 +47,15 @@ class ReductionCircuits(StoreCase):
         self.payload["tool_use_id"] = "third"
         self.assertEqual(self.invoke(broken), "")
         self.assertEqual(calls, ["first", "first", "second"])
+        # A systemMessage never leaves hook.run (native_text.clean_reply drops it), so the Grep
+        # scope's health is shown by a received-content replacement, which the boundary keeps.
         other = dict(self.payload, tool_name="Grep", tool_response={"content": "evidence", "code": 200})
-        self.assertEqual(json.loads(self.invoke(lambda ctx: {"systemMessage": "unaffected"}, payload=other)), {"systemMessage": "unaffected"})
+        unaffected = lambda ctx: hook.updated_tool_output(ctx.event, {"content": "evidence", "code": 200})
+        with patch.object(hook.token_gate, "permits_reply", return_value=True):   # no saving to gate here
+            emitted = self.invoke(unaffected, payload=other)
+        self.assertEqual(json.loads(emitted),
+                         {"hookSpecificOutput": {"hookEventName": "PostToolUse",
+                                                 "updatedToolOutput": {"content": "evidence", "code": 200}}})
         files = list(Path(self.store.path).rglob("*.json"))
         self.assertNotIn("secret command", "".join(path.read_text() for path in files))
         self.assertEqual(ledger.load(self.store), [])
@@ -66,9 +73,11 @@ class ReductionCircuits(StoreCase):
         self.assertEqual(ledger.load(self.store), [])
 
     def test_serialization_faults_count_but_stdout_or_accounting_failures_do_not(self):
+        # An unknown top-level key is dropped by clean_reply before serialization, so the
+        # unserializable value sits under a kept key ("continue") to reach json.dumps.
         for identity in ("first", "second"):
             self.payload["tool_use_id"] = identity
-            self.assertEqual(self.invoke(lambda _: {"not_json": {1}}), "")
+            self.assertEqual(self.invoke(lambda _: {"continue": {1}}), "")
         self.assertTrue(circuit.read(self.store, "trim-tool-output:Bash")["disabled"])
         other = dict(self.payload, tool_name="Grep", tool_response={"content": "evidence"}, tool_use_id="other")
         class BrokenOutput(io.StringIO):
@@ -76,7 +85,9 @@ class ReductionCircuits(StoreCase):
                 raise BrokenPipeError("closed client")
         with patch.dict(os.environ, self.env, clear=True), patch.object(sys, "stdin", io.StringIO(json.dumps(other))), \
                 contextlib.redirect_stdout(BrokenOutput()):
-            hook.run(("PostToolUse",), lambda _: {"systemMessage": "ok"}, reducer="trim-tool-output")
+            # A reply the boundary keeps (received content), so the write is attempted and fails.
+            hook.run(("PostToolUse",), lambda ctx: hook.updated_tool_output(ctx.event, {"content": "evidence"}),
+                     reducer="trim-tool-output")
         self.assertEqual(circuit.read(self.store, "trim-tool-output:Grep")["faults"], 0)
 
     def test_quarantine_survives_compaction_and_does_not_hide_exact_recovery(self):

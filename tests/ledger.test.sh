@@ -40,6 +40,10 @@ same(ledger.context_nudge(130000.0), dict(common("UserPromptSubmit", "context_nu
 same(ledger.policy_fallback("ValueError"), dict(common("Policy", "policy_fallback", 0, 0, 0, 0), reason="ValueError"))
 same(ledger.stale_guard(262000.0, 730.9), dict(common("UserPromptSubmit", "stale_guard", 0, 0, 0, 0), context_tokens=262000, idle_minutes=730))
 same(ledger.stale_guard_continued(262000, 731), dict(common("UserPromptSubmit", "stale_guard_continued", 0, 0, 0, 0), context_tokens=262000, idle_minutes=731))
+# The polling_launch/polling_collect/polling_sleep kinds went with hooks/poll-collect.py: the
+# polling runtime (hooks/lib/polling_runtime.py) reports through hook telemetry, not the ledger.
+assert not any(hasattr(ledger, n) for n in ("polling_launched", "polling_collected", "polling_shortened"))
+assert not any(k.startswith("polling_") for k in ledger.KINDS)
 same(ledger.context_nudge_accepted(130000, "s-1", "compact"), dict(common("SessionStart", "context_nudge_accepted", 0, 0, 0, 0),
      context_tokens=130000, nudged_session_id="s-1", action="compact"))
 same(ledger.cache_nudge(40000, 2), dict(common("SessionStart", "cache_nudge", 0, 0, 0, 0), context_tokens=40000, est_cache_write_usd=2.0))

@@ -10,8 +10,9 @@ update (each runtime SHA gets its own directory). Installing means copying
 the 12 MB runtime into the data dir, hashing it and running it for the first
 time; on a machine whose antivirus scans a freshly written, unsigned binary
 (Windows Defender) that first exec can take seconds. So hooks/session-start.sh
-does not install: it starts scripts/runtime.sh --install detached and answers
-at once that the runtime is being set up. The cold hook must finish under
+does not install: it starts scripts/runtime.sh --install detached and returns
+at once, silently (no "setting up" notice: the hook prints only its failure
+warning). The cold hook must finish under
 COLD_BOUND, inside the hook timeout on every platform; the install must then
 complete on its own, after the hook (and, for a real session, after the CLI)
 has exited; and the next session is warm.
@@ -35,8 +36,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tests"))
 import host_retry  # noqa: E402
 from native_canary_qualification import (SESSION_START_BOUND, run_session_start, runtime_sha256,  # noqa: E402
-                                         runtime_target, session_start_timeout)
-from native_host import Host, assert_hooks_fail_open, bash, wait_for  # noqa: E402
+                                         runtime_target, session_start_responses, session_start_timeout)
+from native_host import Host, assert_hooks_fail_open, bash, hook_names, wait_for  # noqa: E402
 
 RUNTIME = "ork-meter-plugin-runtime" + (".exe" if os.name == "nt" else "")
 # The cold hook starts the install and returns: inside the hook timeout with
@@ -44,7 +45,9 @@ RUNTIME = "ork-meter-plugin-runtime" + (".exe" if os.name == "nt" else "")
 COLD_BOUND = session_start_timeout() - 0.5
 INSTALL_WAIT = 90
 SLOW_INSTALL = 15
-SETTING_UP = "Ork Meter: setting up its runtime in the background"
+# hooks/session-start.sh prints only this, when the runtime cannot run at all;
+# a cold session (install started detached) and a warm one print nothing.
+UNAVAILABLE = "Ork Meter: automatic capture is unavailable."
 TIMINGS = {}
 
 # One cold install by hand, as scripts/runtime.sh does it, with a timestamp
@@ -130,11 +133,15 @@ class NativeRuntimeInstall(unittest.TestCase):
             host.assert_credential_store_isolated()
             self.assertEqual(self.installed(host), [], "the data dir starts empty")
             cold, message = run_session_start(self, host, bound=COLD_BOUND)
-            self.assertIn(SETTING_UP, message)
+            # Silent (hooks/session-start.sh: a 75 from --if-installed starts the
+            # detached install and prints nothing); the install is the evidence.
+            self.assertEqual(message, "", "a cold SessionStart prints nothing")
             background = self.wait_installed(host)
             self.assertTrue(self.installed(host), "scripts/runtime.sh installed the shipped runtime")
             warm, message = run_session_start(self, host, bound=SESSION_START_BOUND)
-            self.assertIn("/ork-meter:connect", message)
+            # The installed runtime's own notice (its /ork-meter:connect hint)
+            # goes to /dev/null; the warm hook is silent too, not the warning.
+            self.assertEqual(message, "", "a warm SessionStart prints nothing")
             TIMINGS["session_start"] = {"cold": round(cold, 2), "warm": round(warm, 2), "cold_bound": COLD_BOUND,
                                         "background_install_after_hook": round(background, 2),
                                         "hook_timeout": session_start_timeout()}
@@ -164,7 +171,12 @@ class NativeRuntimeInstall(unittest.TestCase):
             elapsed = time.monotonic() - started
             pending = not self.install_finished(host)
             assert_hooks_fail_open(self, completed.stdout)
-            self.assertIn(SETTING_UP, completed.stdout)
+            # The cold SessionStart ran and printed nothing: no "setting up"
+            # notice any more, and not the failure warning either.
+            self.assertIn("SessionStart:startup", hook_names(completed.stdout))
+            self.assertEqual(session_start_responses(completed.stdout), [],
+                             "a cold session's SessionStart must be silent")
+            self.assertNotIn(UNAVAILABLE, completed.stdout)
             self.assertIn("QUALIFIED", completed.stdout)
             self.assertLess(elapsed, SLOW_INSTALL, "the session did not wait for the install")
             self.assertTrue(pending, "the install was still running when the CLI exited")

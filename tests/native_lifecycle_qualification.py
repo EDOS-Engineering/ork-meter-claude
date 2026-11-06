@@ -28,10 +28,47 @@ from native_host import (Host, assert_hooks_fail_open, call_sha, compact_boundar
 sys.path.insert(0, str(ROOT / "hooks/lib"))
 import ledger  # noqa: E402
 import session  # noqa: E402
+import trimmer  # noqa: E402
 
-DEDUPE_NOTE = "is unchanged since your earlier Read"
-DELTA_NOTE = "Ork Meter delta:"
-TRIM_NOTE = "Ork Meter trimmed this Read"
+# hooks/lib/native_text.py clean_reply drops additionalContext at the emission
+# boundary, so no "Ork Meter ..." note (dedupe, delta, trim) reaches the model;
+# the transcript holds only received file lines, and the ledger the kind.
+NOTE = "Ork Meter"
+
+
+def assert_delivered_without_notes(test, body, identifier):
+    """The tool result reached the model with no plugin-authored text after it."""
+    test.assertNotIn(NOTE, text_after(body, identifier))
+    test.assertNotIn("Full original Read snapshot", text_after(body, identifier))
+    return result_text(tool_results(body)[identifier])
+
+
+def assert_dedupe_delivery(test, body, identifier, tag):
+    """A repeated identical Read is its first trimmer.FIRST_LINES lines and
+    nothing else (hooks/dedupe-reads.py; the "is unchanged since" note is gone)."""
+    visible = assert_delivered_without_notes(test, body, identifier)
+    test.assertIn("%s_line_%04d" % (tag, trimmer.FIRST_LINES - 1), visible, tag)
+    test.assertNotIn("%s_line_%04d" % (tag, trimmer.FIRST_LINES), visible, tag)
+    test.assertNotIn(tag + "_line_0119", visible, tag)
+
+
+def assert_delta_delivery(test, body, identifier, tag, marker):
+    """A changed re-read is the diff's received lines only: the changed line
+    and its context, no '@@' header, no removed line, no "Ork Meter delta:"
+    note (native_text.source_output keeps '+' and ' ' lines as file lines)."""
+    visible = assert_delivered_without_notes(test, body, identifier)
+    test.assertIn("%s_line_0060 %s " % (tag, marker), visible, tag)
+    test.assertNotIn("@@ -", visible, tag)
+    test.assertNotIn(tag + "_line_0000", visible, tag + " must not be delivered whole")
+    test.assertNotIn(tag + "_line_0119", visible, tag + " must not be delivered whole")
+
+
+def assert_trim_delivery(test, body, identifier, tag, last):
+    """A trimmed Read is its head: the first line, not the last, and no
+    "Ork Meter trimmed this Read" note."""
+    visible = assert_delivered_without_notes(test, body, identifier)
+    test.assertIn(tag + "_line_0000", visible, tag)
+    test.assertNotIn("%s_line_%04d" % (tag, last), visible, tag + " must be trimmed")
 
 
 def lines(tag, count=120):
@@ -45,7 +82,8 @@ def change(path, tag):
 
 def touch(path):
     """Same bytes, later mtime: Claude Code reads the file again instead of
-    answering with its own "file unchanged" stub, so the plugin sees it."""
+    answering with its own "file unchanged" stub (hosts before 2.1.317 have
+    one), so the plugin sees it."""
     stat = path.stat()
     os.utime(path, (stat.st_atime + 5, stat.st_mtime + 5))
 
@@ -74,6 +112,21 @@ def log_trim_session_runs(host):
                      "        log.write(json.dumps([ctx.event, ctx.payload.get('source')]) + '\\n')\n"
                      "    return _qualified_handle(ctx)\n\n\nimport json  # noqa: E402\n" % str(log))
     return lambda: [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()] if log.is_file() else []
+
+
+def hook_replies(stream, hook_name):
+    """The JSON replies (parsed ``output``) of every ``hook_name`` response in the stream."""
+    found = []
+    for line in stream.splitlines():
+        try:
+            item = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(item, dict) and item.get("subtype") == "hook_response" and item.get("hook_name") == hook_name:
+            output = str(item.get("output") or "").strip()
+            if output:
+                found.append(json.loads(output))
+    return found
 
 
 def compact_results(stream):
@@ -211,8 +264,8 @@ class NativeLifecycle(unittest.TestCase):
             # The compaction preserved the second answer's exchange: its
             # results first reach the model in the first request after it.
             second = host.requests[states["after_number"] - 1]
-            self.assertIn(DEDUPE_NOTE, text_after(second, tool_id(2, 0)))
-            self.assertIn(DELTA_NOTE, text_after(second, tool_id(2, 1)))
+            assert_dedupe_delivery(self, second, tool_id(2, 0), "a")
+            assert_delta_delivery(self, second, tool_id(2, 1), "b", "ONE")
             # After compaction, before any later tool call: both are gone and the pin is the same file.
             self.assertIsNone(after["reads"], "compaction must reset the repeat-read index")
             self.assertEqual(after["bases"], [], "compaction must drop delta bases")
@@ -223,9 +276,8 @@ class NativeLifecycle(unittest.TestCase):
                 visible = result_text(final[identifier])
                 self.assertIn(needle, visible, tag)
                 self.assertIn(tag + "_line_0119", visible, tag + " must be delivered whole")
-                after_text = text_after(host.requests[number], identifier)
-                self.assertNotIn(DEDUPE_NOTE, after_text)
-                self.assertNotIn(DELTA_NOTE, after_text)
+                self.assertIn(tag + "_line_0000", visible, tag + " must be delivered whole, not as a diff")
+                assert_delivered_without_notes(self, host.requests[number], identifier)
             # The compaction request carried every earlier result as delivered.
             self.assertTrue({tool_id(1, 0), tool_id(1, 1), tool_id(1, 2)} <= set(tool_results(host.requests[compactions[0] - 1])))
             self.assert_history_stable(host.requests)
@@ -316,8 +368,8 @@ class NativeLifecycle(unittest.TestCase):
             for index, tag in ((0, "a"), (1, "b")):
                 identifier = tool_id(number, index)
                 self.assertIn(tag + "_line_0119", result_text(final[identifier]))
-                self.assertNotIn(DELTA_NOTE, text_after(host.requests[number], identifier))
-                self.assertNotIn(DEDUPE_NOTE, text_after(host.requests[number], identifier))
+                self.assertIn(tag + "_line_0000", result_text(final[identifier]))
+                assert_delivered_without_notes(self, host.requests[number], identifier)
             store = next(iter(host.stores().values()))
             rows = ledger.load(store)
             self.assertEqual(rows_by_call(store), [("trim", "Read", call_sha(tool_id(1, 2)))])
@@ -377,7 +429,7 @@ class NativeLifecycle(unittest.TestCase):
             store = host.stores()[original]
             pin = Path(store.policy_path).read_bytes()
             self.assertEqual(sorted(session.read_json(store.reads_path, {})), sorted([str(a), str(b)]))
-            self.assertIn(DELTA_NOTE, text_after(host.requests[2], tool_id(2, 0)))
+            assert_delta_delivery(self, host.requests[2], tool_id(2, 0), "b", "ONE")
             self.assertEqual(rows_by_call(store), [("delta", "Read", call_sha(tool_id(2, 0)))])
             turn_one = len(host.requests)
 
@@ -400,9 +452,9 @@ class NativeLifecycle(unittest.TestCase):
             self.assertEqual(Path(store.policy_path).read_bytes(), pin, "resume keeps the session's pin")
             results = tool_results(host.requests[turn_one + 1])
             for identifier, tag in ((tool_id(turn_one + 1, 0), "a"), (tool_id(turn_one + 1, 1), "b")):
-                visible = result_text(results[identifier])
+                visible = assert_delivered_without_notes(self, host.requests[turn_one + 1], identifier)
                 self.assertIn(tag + "_line_0119", visible)
-                self.assertNotIn("Ork Meter", text_after(host.requests[turn_one + 1], identifier))
+                self.assertIn(tag + "_line_0000", visible)
             self.assertEqual(rows_by_call(store), [("delta", "Read", call_sha(tool_id(2, 0)))])
             self.assertEqual(history(host.requests[turn_one]["messages"][:len(host.requests[turn_one - 1]["messages"])]),
                              history(host.requests[turn_one - 1]["messages"]),
@@ -432,8 +484,8 @@ class NativeLifecycle(unittest.TestCase):
             fork_pin = json.loads(Path(fork_store.policy_path).read_text(encoding="utf-8"))
             self.assertEqual(fork_pin["session_id"], fork)
             self.assertEqual(fork_pin["settings"]["ORK_METER_TRIM_BUDGET_READ"], "1024")
-            for index in (0, 1):
-                self.assertIn(TRIM_NOTE, text_after(host.requests[turn_two + 1], tool_id(turn_two + 1, index)))
+            for index, tag in ((0, "a"), (1, "b")):
+                assert_trim_delivery(self, host.requests[turn_two + 1], tool_id(turn_two + 1, index), tag, 119)
             self.assertEqual(sorted(rows_by_call(fork_store)), sorted(
                 [("trim", "Read", call_sha(tool_id(turn_two + 1, index))) for index in (0, 1)]))
             self.assert_pinned(fork_store, ledger.load(fork_store))
@@ -469,45 +521,75 @@ class NativeLifecycle(unittest.TestCase):
 
     # --- background and interrupted results ---------------------------------
 
-    def test_background_bash_launch_passes_through_and_output_read_is_credited_to_read(self):
+    def test_background_bash_launch_is_collected_in_the_foreground_and_credited_as_a_trim(self):
+        """Was "background launch passes through, the output Read is credited":
+        hooks/lib/polling_runtime.py launch() now owns a ``run_in_background``
+        Bash inside the native timing window (UserPromptSubmit sets it): the
+        PreToolUse reply runs it in the foreground with the receipt appended,
+        so the real output comes back in the launch's own result, under the
+        ordinary trim policy, and no completion notification or output-file
+        Read follows."""
         with Host(self, "ork-native-background-", "Bash,Read") as host:
             program = host.work / "background.py"
+            # Over the Bash trim budget, under Claude Code's own 30,000-char
+            # persisted-output cap (a persisted result is left alone, #351).
             program.write_text("import sys, time\n"
-                               "for i in range(900):\n"
+                               "for i in range(500):\n"
                                "    print('bg_line_%04d background evidence padding padding' % i)\n"
-                               "    if i == 450: print('ERROR: background-middle diagnostic')\n"
+                               "    if i == 250: print('ERROR: background-middle diagnostic')\n"
                                "sys.stdout.flush()\ntime.sleep(1)\nprint('bg_done')\n", encoding="utf-8")
             command = shlex.quote(sys.executable.replace("\\", "/")) + " background.py"
-            outputs = []
+            notifications = []
 
             def script(body, number):
                 if number == 1:
                     return [("tool", "Bash", {"command": command, "run_in_background": True,
                                               "description": "Run the background fixture"})]
-                text = json.dumps(body["messages"][-1])
-                found = re.search(r"<output-file>(.*?)</output-file>", text)
-                if found and not outputs:
-                    outputs.extend([json.loads('"%s"' % found.group(1)), number])
-                    return [("tool", "Read", {"file_path": outputs[0]})]
+                if re.search(r"<output-file>(.*?)</output-file>", json.dumps(body["messages"][-1])):
+                    notifications.append(number)
                 return [("text", "QUALIFIED")]
             host.script = script
             completed = host.run("Run the fixture in the background.", timeout=120)
             host.assert_no_external_traffic()
             self.assert_hooks_fail_open(completed.stdout)
+            self.assertIn("PreToolUse:Bash", hook_names(completed.stdout))
             self.assertIn("PostToolUse:Bash", hook_names(completed.stdout))
-            launch = result_text(tool_results(host.requests[1])[tool_id(1, 0)])
-            self.assertIn("background", launch.lower())
-            self.assertNotIn("Ork Meter", text_after(host.requests[1], tool_id(1, 0)))
-            self.assertTrue(outputs, "the completion notification must name the output file")
-            identifier = tool_id(outputs[1], 0)
-            delivered = text_after(host.requests[outputs[1]], identifier)
-            self.assertIn(TRIM_NOTE, delivered)
+            # The launch is owned: run in the foreground, the receipt appended
+            # to the command (polling_runtime.launch, updatedInput survives
+            # native_text.clean_reply).
+            launches = [reply["hookSpecificOutput"]["updatedInput"] for reply in hook_replies(completed.stdout, "PreToolUse:Bash")
+                        if "updatedInput" in reply.get("hookSpecificOutput", {})]
+            self.assertEqual(len(launches), 1, launches)
+            self.assertIs(launches[0].get("run_in_background"), False, launches[0])
+            self.assertTrue(launches[0]["command"].startswith(command + "\n"), launches[0]["command"])
+            self.assertIn("polling_receipt.py", launches[0]["command"])
+            self.assertEqual(notifications, [], "no background completion notification: the output came back inline")
+            self.assertEqual(len(host.requests), 2, "the launch result ends the turn; no output-file Read")
+            # The real output reached the model in the launch's result, trimmed
+            # (head, the diagnostic line, tail) with no "Ork Meter trimmed" marker.
+            identifier = tool_id(1, 0)
+            delivered = assert_delivered_without_notes(self, host.requests[1], identifier)
+            self.assertNotIn("Command running in background", delivered, "no background-launch stub: the output itself")
+            self.assertNotIn("<persisted-output>", delivered)
+            self.assertIn("bg_line_0000", delivered)
             self.assertIn("ERROR: background-middle diagnostic", delivered)
-            self.assertIn("bg_done", Path(outputs[0]).read_text(encoding="utf-8"))
+            self.assertIn("bg_done", delivered)
+            self.assertLess(delivered.count("bg_line_"), 500, "the output was trimmed")
+            self.assertNotIn("\u2026 [", delivered)
             stores = list(host.stores().values())
             self.assertEqual(len(stores), 1)
-            self.assertEqual(rows_by_call(stores[0]), [("trim", "Read", call_sha(identifier))],
-                             "only the Read of the output file may be credited")
+            # Credited once, to the launch itself, as a trim of its real output.
+            self.assertEqual(rows_by_call(stores[0]), [("trim", "Bash", call_sha(identifier))])
+            rows = ledger.load(stores[0])
+            self.assertTrue(rows[0].get("native_text_boundary_reconciled"), rows[0])
+            self.assert_pinned(stores[0], rows)
+            # The telemetry row of the owning PreToolUse run (hooks/lib/hook_telemetry.py).
+            telemetry = [json.loads(line) for line in
+                         (Path(stores[0].path) / "hook-invocations.jsonl").read_text(encoding="utf-8").splitlines()]
+            owned = [row for row in telemetry if row["event"] == "PreToolUse" and row["tool"] == "Bash"
+                     and row["phase"] == "finished" and row.get("effects", {}).get("input_updated")]
+            self.assertEqual(len(owned), 1, telemetry)
+            self.assertEqual((owned[0]["decision"], owned[0]["reason"]), ("applied", "reply-emitted"), owned[0])
             self.assert_history_stable(host.requests)
 
     def test_interrupted_tool_call_fails_open_and_is_not_credited(self):
@@ -568,7 +650,7 @@ class NativeLifecycle(unittest.TestCase):
             self.assertFalse(finished_early, "the turn must end before the command finishes")
             self.assertEqual(len(host.requests), 2)
             delivered = tool_results(host.requests[1])
-            self.assertIn(TRIM_NOTE, text_after(host.requests[1], tool_id(1, 0)))
+            assert_trim_delivery(self, host.requests[1], tool_id(1, 0), "big", 899)
             self.assertTrue(delivered[tool_id(1, 1)].get("is_error"))
             interrupted = result_text(delivered[tool_id(1, 1)])
             self.assertNotIn("Ork Meter", interrupted)
@@ -582,9 +664,14 @@ class NativeLifecycle(unittest.TestCase):
             self.assertEqual(len(stores), 1)
             self.assertEqual(rows_by_call(stores[0]), [("trim", "Read", call_sha(tool_id(1, 0)))],
                              "nothing may be credited to the interrupted call")
-            saved = {path.name.split(".")[0] for path in Path(stores[0].path, session.TOOL_OUTPUT_DIR).glob("*")}
-            self.assertEqual(len(saved), 1, "only the trimmed Read's snapshot may be saved")
-            self.assertIn(next(iter(saved)), text_after(host.requests[1], tool_id(1, 0)))
+            saved = list(Path(stores[0].path, session.TOOL_OUTPUT_DIR).glob("*"))
+            self.assertEqual(len({path.name.split(".")[0] for path in saved}), 1,
+                             "only the trimmed Read's snapshot may be saved")
+            # The snapshot's path is no longer cited to the model (the note is
+            # dropped at the boundary); the artifact itself holds the whole Read.
+            self.assertTrue(any("big_line_0899" in path.read_text(encoding="utf-8") for path in saved), saved)
+            self.assertFalse([path for path in saved if "slow_line" in path.read_text(encoding="utf-8")],
+                             "nothing of the interrupted call may be saved")
             failures = session.read_json(stores[0].failures_path, {})
             self.assertEqual(failures, {}, "an interrupt is not a failure for the loop guard")
             self.assert_history_stable(host.requests)

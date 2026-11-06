@@ -15,6 +15,7 @@ from native_result_assertions import assert_host_suffix
 sys.path.insert(0, str(ROOT / "hooks/lib"))
 import artifacts
 import ledger
+import recovery
 import session
 
 
@@ -103,8 +104,10 @@ class NativeRestrictedRecovery(unittest.TestCase):
     def test_restricted_session_reads_trimmed_output_with_bash_as_the_note_says(self):
         """#269: under --restricted the file tools are confined to the
         workspace, so a Read of the saved output is refused (a wasted
-        request). The note says to read it with Bash; sed -n pages of it
-        arrive untrimmed and nothing is denied."""
+        request). The "Full output: <path>" note and its Bash hint no longer
+        reach the model (native_text.source_output keeps received lines only);
+        the saved output is still written, outside the workspace, and Bash
+        sed -n pages of it arrive untrimmed with nothing denied."""
         with Host(self, "ork-native-restricted-recovery-", "Bash,Read") as host:
             # 27 KB: over the 12 KiB Bash budget, under the CLI's own 30,000
             # character Bash limit, as each page is.
@@ -116,10 +119,15 @@ class NativeRestrictedRecovery(unittest.TestCase):
                 if number == 1:
                     return [("tool", "Bash", {"command": "cat big.txt"})]
                 if number == 2:
-                    seen["note"] = result_text(tool_results(body)[tool_id(1, 0)]).rsplit("Full output: ", 1)[1]
-                    seen["path"] = seen["note"].rsplit(" (", 1)[0]
+                    # The note named the artifact; now it is located from the
+                    # session store the first Bash's hooks wrote (one snapshot).
+                    [store] = host.stores().values()
+                    [path] = Path(store.tool_output_dir()).glob("*.txt")
+                    # The store spells paths in the Windows \\?\ namespace; the
+                    # note gave the model the ordinary spelling, which sed needs.
+                    seen["path"] = session.display_path(str(path))
                 if number in (2, 3):
-                    # Numeric ranges, as the note shows: on Windows (2.1.280 and
+                    # Numeric ranges, as the note showed: on Windows (2.1.280 and
                     # 2.1.302) the CLI's permission check denies sed -n '451,$p'
                     # of the same file in dontAsk mode, though Bash is allowed.
                     pages = {2: "1,450p", 3: "451,900p"}
@@ -134,11 +142,20 @@ class NativeRestrictedRecovery(unittest.TestCase):
                 result_text(block)[:600] for body in host.requests[2:] for block in tool_results(body).values()
                 if block.get("is_error")])
             first = result_text(tool_results(host.requests[1])[tool_id(1, 0)])
-            self.assertIn("Ork Meter trimmed", first, first[-1000:])
+            self.assertNotIn("Ork Meter", first, first[-1000:])
+            self.assertNotIn("Full output:", first)
+            self.assertIn("record_0000", first)
+            self.assertIn("record_0899", first)
             self.assertNotIn("record_0450", first, "the middle was trimmed away")
-            self.assertEqual(seen["note"].split("\n")[1],
-                             "Outside the workspace; Bash sed -n 'A,Bp', head, tail or cat reads it.")
-            assert_host_suffix(self, "\n".join(seen["note"].split("\n")[2:]), host.work)
+            # The artifact the note used to point at: outside the workspace
+            # (why Bash, not Read, reads it), holding the output as received.
+            self.assertTrue(recovery.outside(seen["path"], str(host.work)), seen["path"])
+            # The Bash tool drops the output's final newline before the hook sees it.
+            # trim-tool-output.py saves stdout + "\n--- stderr ---\n" + stderr; on
+            # Windows the host's stderr carries its "Shell cwd was reset" notice.
+            saved, _, saved_stderr = Path(seen["path"]).read_text(encoding="utf-8").partition("\n--- stderr ---\n")
+            self.assertEqual(saved, text.rstrip("\n"))
+            assert_host_suffix(self, saved_stderr, host.work)
             recovered = ""
             for number in (2, 3):
                 block = tool_results(host.requests[number])[tool_id(number, 0)]
@@ -156,11 +173,13 @@ class NativeRestrictedRecovery(unittest.TestCase):
             # original is the cat output as the hook received it.
             self.assertEqual(recovered, text, "the pages are the full original")
             [store] = host.stores().values()
-            self.assertEqual([row["kind"] for row in ledger.load(store)], ["trim"])
+            [row] = ledger.load(store)
+            self.assertEqual((row["kind"], row["tool"], row.get("native_text_boundary_reconciled")), ("trim", "Bash", True))
+            self.assertLess(row["bytes_after"], row["bytes_before"])
             self.assertEqual(len(list(Path(store.tool_output_dir()).glob("*.txt"))), 1, "no second artifact")
 
             # Control: a Read of the same path in this restricted host is
-            # refused, which is why the note points at Bash.
+            # refused, which is why Bash is the way to read it.
             host.requests.clear()
             host.script = lambda body, number: ([("tool", "Read", {"file_path": seen["path"]})] if number == 1
                                                 else [("text", "QUALIFIED")])

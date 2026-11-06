@@ -141,9 +141,6 @@ def handle(ctx):
         features.prune_session_state(env, STATE_DIRS, now)
     messages = []
     if source in ("startup", "resume"):
-        line = features.status_line(env)
-        if line:
-            messages.append(line)
         ignored = project_env.notice(getattr(ctx, "ignored_project_settings", ()))
         if ignored:
             messages.append(ignored)

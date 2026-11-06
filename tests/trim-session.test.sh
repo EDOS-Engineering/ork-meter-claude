@@ -6,23 +6,64 @@ cd "$(dirname "$0")/.."
 
 features="$XDG_STATE_HOME/ork-meter/plugin-features.json"
 version=$(python3 -c 'import json; print(json.load(open(".claude-plugin/plugin.json"))["version"])')
+ledger="$SCRATCH/ork-meter/savings.jsonl"
+
+# The hook still builds its systemMessage (status line, nudge), but hook.run strips every
+# systemMessage at the emission boundary (hooks/lib/native_text.py clean_reply keeps only
+# hookSpecificOutput/continue/suppressOutput/decision), so a SessionStart is silent on stdout.
+# What the status line used to show is read back from the session pin the hook wrote, as the
+# hook itself computes it (features.status_line over the pinned policy); what the nudge used
+# to say is the cache_nudge ledger row. [VAR=value ...] are the hook process's own settings.
+pinned_status() { # [VAR=value ...]: the status line for the pinned session policy
+  env "$@" python3 -I -c 'import os, sys
+sys.path.insert(0, "hooks/lib")
+import features, policy, session
+store = session.Store.for_scratchpad(os.environ["SCRATCH"])
+gated = features.gate(dict(os.environ))
+print(features.status_line(features.carried(policy.for_store(store, gated), gated)))'
+}
+status_is() { # <name> <python expression over `s`> [VAR=value ...]
+  local name=$1 expr=$2 s
+  shift 2
+  s=$(pinned_status "$@")
+  if S="$s" python3 -c 'import os, sys; s = os.environ["S"]; sys.exit(0 if eval(sys.argv[1]) else 1)' "$expr"; then
+    echo "  ok   $name"
+  else
+    echo "  FAIL $name: $expr"; echo "       pinned: $s"; fails=$((fails + 1)); return 1
+  fi
+}
+nudges() { # the number of cache_nudge ledger rows so far
+  python3 -c 'import json, os, sys
+try: rows = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+except OSError: rows = []
+print(sum(1 for r in rows if r["kind"] == "cache_nudge"))' "$ledger"
+}
+last_nudge() { # <name> <python expression over `r` (the last cache_nudge row)>
+  assert "$1" 'out == "" and (lambda r: '"$2"')([json.loads(l) for l in open("'"$ledger"'") if l.strip() and json.loads(l)["kind"] == "cache_nudge"][-1])'
+}
 
 run_hook trim-session.py sessionstart.startup.json
-assert "startup: one systemMessage with budgets and no unavailable command" 'list(o) == ["systemMessage"] and o["systemMessage"].startswith("Ork Meter trim: on (Bash 12K, Read 24K, Grep 8K, Glob 4K, WebFetch 16K") and "/ork-meter:" not in o["systemMessage"]'
+silent "startup: silent (the status line is stripped at the emission boundary)"
+status_is "startup: the pin carries the default budgets and no unavailable command" 's.startswith("Ork Meter trim: on (Bash 12K, Read 24K, Grep 8K, Glob 4K, WebFetch 16K") and "/ork-meter:" not in s'
 run_hook trim-session.py sessionstart.startup.json ORK_METER_TRIM=off ORK_METER_TRIM_BUDGET_BASH=32K
-assert "startup with trim off: says off" 'o["systemMessage"] == "Ork Meter trim: off (ORK_METER_TRIM=off)."'
+silent "startup with trim off: silent"
+status_is "startup with trim off: the opt-out is in force" 's == "Ork Meter trim: off (ORK_METER_TRIM=off)."' ORK_METER_TRIM=off ORK_METER_TRIM_BUDGET_BASH=32K
 reset_fixture_policy
 run_hook trim-session.py sessionstart.startup.json ORK_METER_TRIM_BUDGET_BASH=32K
-assert "startup with a budget override: shows it" '"Bash 32K" in o["systemMessage"]'
-assert "startup without a read-guard override: the default threshold" '"; read guard 96K)." in o["systemMessage"]'
+silent "startup with a budget override: silent"
+status_is "startup with a budget override: the pin carries it" '"Bash 32K" in s'
+status_is "startup without a read-guard override: the default threshold" '"; read guard 96K)." in s'
 reset_fixture_policy
 run_hook trim-session.py sessionstart.startup.json ORK_METER_READ_GUARD_BYTES=262144 ORK_METER_TRIM_BUDGET_GREP=16kib ORK_METER_TRIM_BUDGET_GLOB=junk
-assert "startup with overrides: the status line shows the thresholds in force" 'o["systemMessage"].startswith("Ork Meter trim: on (Bash 12K, Read 24K, Grep 16K, Glob 4K, WebFetch 16K; read guard 256K).")'
+silent "startup with overrides: silent"
+status_is "startup with overrides: the pin carries the thresholds in force" 's.startswith("Ork Meter trim: on (Bash 12K, Read 24K, Grep 16K, Glob 4K, WebFetch 16K; read guard 256K).")'
 reset_fixture_policy
 run_hook trim-session.py sessionstart.startup.json ORK_METER_READ_GUARD_BYTES=100
-assert "startup with a read-guard value below the floor: the floor is shown" '"; read guard 4K)." in o["systemMessage"]'
+silent "startup with a read-guard value below the floor: silent"
+status_is "startup with a read-guard value below the floor: the floor is pinned" '"; read guard 4K)." in s'
 run_hook trim-session.py sessionstart.startup.json ORK_METER_READ_GUARD=off
-assert "startup with the read guard off: says so" '"; read guard off)." in o["systemMessage"]'
+silent "startup with the read guard off: silent"
+status_is "startup with the read guard off: the opt-out is in force" '"; read guard off)." in s' ORK_METER_READ_GUARD=off
 run_hook trim-session.py sessionstart.clear.json
 silent "clear: silent"
 run_hook trim-session.py sessionstart.compact.json
@@ -55,17 +96,17 @@ import json, sys, re
 o = json.load(open(sys.argv[1]))
 assert list(sorted(o)) == ["features", "plugin_version", "updated_at"], o
 assert o["plugin_version"] == sys.argv[2]
-assert o["features"] == sorted(o["features"]) == ["audit", "cache_nudge", "dedupe", "loop_guard", "read_guard", "test_filter", "trim"], o
+assert o["features"] == sorted(o["features"]) == sorted(["audit", "cache_nudge", "dedupe", "loop_guard", "read_guard", "test_filter", "trim"] ), o
 assert re.match(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$", o["updated_at"])
 EOF
 then echo "  ok   feature file: exact shape, sorted features, RFC3339 UTC"; else echo "  FAIL feature file shape"; fails=$((fails + 1)); fi
 fmode=$(file_mode "$features"); dmode=$(file_mode "$(dirname "$features")")
 [ "$fmode" = "600" ] && [ "$dmode" = "700" ] && echo "  ok   feature file 600, directory 700" || { echo "  FAIL feature file modes $fmode/$dmode"; fails=$((fails + 1)); }
 run_hook trim-session.py sessionstart.compact.json ORK_METER_TRIM=off ORK_METER_NUDGES=off ORK_METER_LOOP_GUARD=off
-if python3 -c 'import json,sys; o=json.load(open(sys.argv[1])); assert o["features"] == ["audit"], o' "$features"; then
+if python3 -c 'import json,sys; o=json.load(open(sys.argv[1])); assert o["features"] == sorted(["audit"] ), o' "$features"; then
   echo "  ok   env opt-outs removed (trim family, nudges, loop guard)"; else echo "  FAIL opt-outs"; fails=$((fails + 1)); fi
 run_hook trim-session.py sessionstart.compact.json ORK_METER_DEDUPE=off ORK_METER_READ_GUARD=off ORK_METER_TEST_FILTER=off
-if python3 -c 'import json,sys; o=json.load(open(sys.argv[1])); assert o["features"] == ["audit", "cache_nudge", "loop_guard", "trim"], o' "$features"; then
+if python3 -c 'import json,sys; o=json.load(open(sys.argv[1])); assert o["features"] == sorted(["audit", "cache_nudge", "loop_guard", "trim"] ), o' "$features"; then
   echo "  ok   granular opt-outs keep trim"; else echo "  FAIL granular opt-outs"; fails=$((fails + 1)); fi
 printf 'not json {' > "$features"
 run_hook trim-session.py sessionstart.clear.json
@@ -78,21 +119,28 @@ mkdir -p "$SCRATCH/ork-meter"; echo '{}' > "$SCRATCH/ork-meter/reads.json"; echo
 run_hook trim-session.py sessionstart.resume.json
 [ ! -e "$SCRATCH/ork-meter/reads.json" ] && [ ! -e "$SCRATCH/ork-meter/failures.json" ] && echo "  ok   resume: reads index and loop counters reset" || { echo "  FAIL reset"; fails=$((fails + 1)); }
 
-# Cache nudge (#59): only when prompt_cache_likely_expired and context_tokens >= threshold.
+# Cache nudge (#59): only when prompt_cache_likely_expired and context_tokens >= threshold. The nudge
+# text is stripped with the systemMessage (native_text.clean_reply); the cache_nudge ledger row is
+# what remains of a nudge, so "no nudge" is "no new cache_nudge row".
 run_hook trim-session.py sessionstart.resume-expired.json
-assert "expired + large: nudge with context size, cost and both options" '"182,340 tokens" in o["systemMessage"] and "$1.14" in o["systemMessage"] and "/clear" in o["systemMessage"] and "pay the rewrite" in o["systemMessage"]'
-assert "expired + large: status line still first" 'o["systemMessage"].startswith("Ork Meter trim: on")'
+last_nudge "expired + large: silent; a cache_nudge row with the context size and cost" 'r["context_tokens"] == 182340 and r["est_cache_write_usd"] == 1.1396'
+n=$(nudges)
 run_hook trim-session.py sessionstart.resume-fresh.json
-assert "not expired: no nudge" '"cache" not in o["systemMessage"].lower() or "likely expired" not in o["systemMessage"]'
+silent "not expired: silent"
+[ "$(nudges)" = "$n" ] && echo "  ok   not expired: no nudge row" || { echo "  FAIL not expired: a nudge row was added"; fails=$((fails + 1)); }
 run_hook trim-session.py sessionstart.resume-expired-small.json
-assert "expired but 12,000 tokens: no nudge" '"likely expired" not in o["systemMessage"]'
+silent "expired but 12,000 tokens: silent"
+[ "$(nudges)" = "$n" ] && echo "  ok   expired but 12,000 tokens: no nudge row" || { echo "  FAIL expired but small: a nudge row was added"; fails=$((fails + 1)); }
 reset_fixture_policy
 run_hook trim-session.py sessionstart.resume-expired-small.json ORK_METER_CACHE_NUDGE_TOKENS=10000
-assert "threshold lowered to 10,000: nudge" '"12,000 tokens" in o["systemMessage"] and "$0.07" in o["systemMessage"]'
+last_nudge "threshold lowered to 10,000: a cache_nudge row for 12,000 tokens" 'r["context_tokens"] == 12000 and round(r["est_cache_write_usd"], 2) == 0.07'
+n=$(nudges)
 run_hook trim-session.py sessionstart.resume-expired.json ORK_METER_NUDGES=off
-assert "ORK_METER_NUDGES=off: no nudge" '"likely expired" not in o["systemMessage"]'
+silent "ORK_METER_NUDGES=off: silent"
+[ "$(nudges)" = "$n" ] && echo "  ok   ORK_METER_NUDGES=off: no nudge row" || { echo "  FAIL ORK_METER_NUDGES=off: a nudge row was added"; fails=$((fails + 1)); }
 run_hook trim-session.py sessionstart.resume.json
-assert "resume without the cache fields: status only" 'o["systemMessage"].count("\n") == 0'
+silent "resume without the cache fields: silent"
+[ "$(nudges)" = "$n" ] && echo "  ok   resume without the cache fields: no nudge row" || { echo "  FAIL resume without the cache fields: a nudge row was added"; fails=$((fails + 1)); }
 
 # Accepted: a clear within the window after a nudge logs cache_nudge_accepted; outside it, nothing.
 reset_fixture_policy

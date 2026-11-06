@@ -225,9 +225,11 @@ class Regressions(unittest.TestCase):
             file = reply["updatedToolOutput"]["file"]
             self.assertLessEqual(trimmer.nbytes(file["content"]), 24576)
             self.assertEqual(file["numLines"], 1)
-            self.assertTrue(file["truncatedByTokenCap"])
-            self.assertIn("rest of that line", reply["additionalContext"])
-            self.assertNotIn("unchanged", reply["additionalContext"])
+            self.assertTrue(file["truncatedByTokenCap"])   # the handler's reply; hook.run's boundary drops the key
+            # The "rest of that line" note is gone: hook.updated_tool_output carries no additionalContext.
+            self.assertNotIn("additionalContext", reply)
+        # Both deliveries are trims of the partial line, never a dedupe stub ("unchanged").
+        self.assertEqual([row["kind"] for row in ledger.load(ctx.store())], ["trim", "trim"])
 
     def test_fallback_store_survives_late_scratchpad_and_lookup(self):
         sid = "late-scratchpad"

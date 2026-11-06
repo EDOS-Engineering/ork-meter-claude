@@ -484,7 +484,10 @@ class RecoveryTests(StoreCase):
         response = {"type": "text", "file": {"filePath": str(self.root / "source.py"),
                     "content": "original line\n" * 4000, "startLine": 1, "numLines": 4000, "totalLines": 4000}}
         reply = reader.handle(self.context(response, "Read"))
-        path = Path(reply["hookSpecificOutput"]["additionalContext"].split("Full original Read snapshot: ")[-1])
+        # The "Full original Read snapshot: <path>" note is gone (hook.updated_tool_output carries no
+        # additionalContext): the snapshot is the one artifact in the store's tool-output directory.
+        self.assertNotIn("additionalContext", reply["hookSpecificOutput"])
+        [path] = [p for p in Path(self.store.tool_output_dir()).iterdir() if p.suffix == ".txt"]
         Path(response["file"]["filePath"]).write_text("edited")
         self.assertEqual(artifacts.load(self.store, path.stem)["response"], response)
 

@@ -9,6 +9,9 @@ cd "$(dirname "$0")/.."
 fails=0
 
 for f in tests/*regressions.py; do
+  # tests/hook_telemetry_regressions.py (d421a74) patches the gate, policy, mode and
+  # circuit it runs hook.run under, so no ORK_METER_* setting can reach it.
+  [ "$f" = tests/hook_telemetry_regressions.py ] && continue
   if ! grep -qE "^(import support|from support import)" "$f"; then
     echo "  FAIL $f does not import tests/support.py"; fails=$((fails + 1))
   fi

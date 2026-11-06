@@ -181,6 +181,22 @@ def sbom_plugin_tree(root):
     (root / "hooks/lib/token_gate.py").write_text('VERSION = "0.14.0"\nVOCAB_SHA256 = "%s"\n' % hashlib.sha256(raw).hexdigest())
     (root / "requirements-hooks.in").write_text("# direct\ntiktoken==0.14.0\n")
     (root / "requirements-hooks.txt").write_text(hook_lock())
+    # The SBOM carries the tree's complete LICENSE under the identifier plugin.json declares.
+    (root / "LICENSE").write_bytes((ROOT / "LICENSE").read_bytes())
+    manifest_path = root / ".claude-plugin/plugin.json"
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {"name": "ork-meter"}
+    manifest["license"] = json.loads((ROOT / ".claude-plugin/plugin.json").read_text())["license"]
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+
+
+def runtime_notices_tree(root, modules=(("golang.org/x/sys", "v0.47.0"),)):
+    """A RUNTIME_THIRD_PARTY_NOTICES.txt naming the Go standard library and
+    ``modules``, the sections runtime_notices.py checks for."""
+    bar = "=" * 78
+    names = ["Go standard library"] + [f"{path} {version}" for path, version in modules]
+    (root / "RUNTIME_THIRD_PARTY_NOTICES.txt").write_text(
+        "".join(f"\n{bar}\n{name}: LICENSE\n{bar}\n\nsynthetic licence\n" for name in names))
 
 
 # What pip_report() resolves: (name, version), each with its wheel's hash

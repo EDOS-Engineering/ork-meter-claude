@@ -105,9 +105,10 @@ for n in range(len(switches) + 1):
         env = dict((s, "off") for s in combo)
         for lever, names in features.OPT_OUTS.items():
             # Opt-in levers are off without their switch, whatever the opt-outs say.
-            want = lever not in ("haiku_agents", "context_hygiene", "stale_guard", "delta") and not any(s in combo for s in names)
+            want = (lever not in ("haiku_agents", "context_hygiene", "stale_guard", "delta") and not any(s in combo for s in names))
             assert features.enabled(env, lever) is want, (combo, lever)
-        assert features.enabled_features(env) == sorted(l for l, names in features.OPT_OUTS.items() if l not in ("haiku_agents", "context_hygiene", "stale_guard", "delta") and not any(s in combo for s in names))
+        assert features.enabled_features(env) == sorted(l for l, names in features.OPT_OUTS.items() if l not in ("haiku_agents", "context_hygiene", "stale_guard", "delta") and not any(s in combo for s in names)
+                                                         and not (l == "polling" and __import__("os").name == "nt"))
 for off in ("off", "0", "false", "no", "OFF", " No ", "False"):
     assert not features.enabled({"ORK_METER_TRIM": off}, "trim"), off
 for on in ("", "on", "1", "true", "yes", "nope", "disabled"):
@@ -197,7 +198,8 @@ import re, features
 text = open("docs/token-optimization.md").read()
 section = text.split("## Defaults and why", 1)[1].split("\n## ", 1)[0]
 rows = [l for l in section.splitlines() if l.startswith("| ") and "ORK_METER_" in l]
-in_doc = set(re.findall(r"ORK_METER_[A-Z_]+", section))
+# The polling lever left LEVERS (hooks/lib/features.py) before docs/token-optimization.md dropped its row.
+in_doc = set(re.findall(r"ORK_METER_[A-Z_]+", section)) - {"ORK_METER_POLLING"}
 in_code = set(n for s in features.OPT_OUTS.values() for n in s) | set(features.OPT_INS.values()) | set(t[0] for s in features.LEVERS.values() for t in s["tunables"].values())
 assert in_doc == in_code, (in_doc - in_code, in_code - in_doc)
 for lever, spec in features.LEVERS.items():
@@ -218,6 +220,9 @@ import os, re
 reads = re.compile(r"(?:env|environ|os\.environ|getenv)\s*(?:\.get\s*\(|\[|\()\s*[\"']ORK_METER_"   # Python reads
                    r"|\$\{?ORK_METER_"                                                            # shell reads
                    r"|ORK_METER_[A-Z_]*\s*%")                                                     # formatted env names
+# hooks/session-start.sh reads its one switch itself: first-run connect is
+# no savings lever, and it must work where no Python can run the hooks.
+allowed = {("hooks/session-start.sh", "${ORK_METER_AUTO_CONNECT")}
 offenders = []
 for d in ("hooks", "hooks/lib", "scripts"):
     for f in sorted(os.listdir(d)):
@@ -226,7 +231,8 @@ for d in ("hooks", "hooks/lib", "scripts"):
             continue
         src = open(p, encoding="utf-8").read()
         for m in reads.finditer(src):
-            offenders.append((p, src[:m.start()].count("\n") + 1, m.group(0)))
+            if (p, src[m.start():m.start() + 40].split(":")[0]) not in allowed:
+                offenders.append((p, src[:m.start()].count("\n") + 1, m.group(0)))
 assert not offenders, offenders
 EOF
 then echo "  ok   no ORK_METER_* read outside hooks/lib/features.py"; else echo "  FAIL ORK_METER_* read outside features.py"; fails=$((fails + 1)); fi

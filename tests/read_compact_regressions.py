@@ -1,10 +1,17 @@
 """Read compaction (hooks/lib/read_compact.py, hooks/dedupe-reads.py, hooks/read-guard.py).
 
 A whole-file Read over the token threshold is compacted by eliding whole
-lines; every shown line stays exact at its own number in Claude Code's
-rendering. Paging is the fallback when the compacted text still doesn't fit.
+lines; every shown line stays exact at its own number in the compactor's
+view. Paging is the fallback when the compacted text still doesn't fit.
 The native side (the CLI's rendering, Edit after an elision) is in
 tests/native_read_compact_qualification.py.
+
+At the emission boundary (hooks/lib/native_text.py, applied by hook.run) the
+hook's note never reaches the model (clean_reply drops additionalContext and
+permissionDecisionReason) and updatedToolOutput keeps only lines received
+from the tool (source_output): the "… lines a–b not shown" markers and the
+empty slots go, numLines is recounted. Which lever acted shows only in the
+ledger (kind read_compact / read_guard / trim) and the write-guard record.
 """
 import hashlib
 import json
@@ -22,6 +29,8 @@ import entitled  # noqa: E402
 entitled.install()
 import circuit  # noqa: E402
 import features  # noqa: E402
+import hook_telemetry  # noqa: E402
+import ledger  # noqa: E402
 import read_compact  # noqa: E402
 import session  # noqa: E402
 import token_gate  # noqa: E402
@@ -348,35 +357,81 @@ class Hooks(unittest.TestCase):
             rows += [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
         return rows
 
-    def test_compacted_result_note_ledger_and_snapshot(self):
+    def telemetry(self):
+        """The finished hook_telemetry rows (docs/hook-telemetry.md) of this scratchpad."""
+        rows = []
+        for path in self.scratch.rglob("hook-invocations.jsonl"):
+            rows += [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+        return [row for row in rows if row.get("phase") == "finished"]
+
+    def emitted(self, reply, text):
+        """The ``file`` of an emitted Read reply, checked at the emission
+        boundary (native_text.clean_reply / source_output): no note, only the
+        received keys, every line one of the original's in order, numLines
+        recounted."""
+        self.assertIsNotNone(reply, "a reply is emitted")
+        self.assertEqual(sorted(reply), ["hookSpecificOutput"])
+        out = reply["hookSpecificOutput"]
+        self.assertNotIn("additionalContext", out)
+        self.assertEqual(sorted(out), ["hookEventName", "updatedToolOutput"])
+        file_info = out["updatedToolOutput"]["file"]
+        self.assertNotIn("truncatedByTokenCap", file_info, "not a received key: dropped by source_output")
+        self.assertEqual(file_info["numLines"], len(file_info["content"].splitlines()), "recounted by source_output")
+        self.assertEqual(file_info["totalLines"], text.count("\n") + 1)
+        self.assertFalse(markers(file_info["content"].split("\n")), "no plugin marker survives the boundary")
+        lines = [line.rstrip() for line in text.split("\n")]
+        cursor = 0
+        for shown in file_info["content"].split("\n"):
+            cursor = lines.index(shown, cursor) + 1   # ValueError: a line the tool never returned
+        return file_info
+
+    def head(self, reply, text, kind):
+        """A Read budget trim or a read guard page: the file's first lines,
+        whole, and a ledger row of ``kind``; the note that used to explain the
+        rest is not emitted."""
+        file_info = self.emitted(reply, text)
+        shown = file_info["content"].split("\n")
+        self.assertEqual(shown, [line.rstrip() for line in text.split("\n")[:len(shown)]], "the head, whole lines")
+        self.assertLess(len(shown), text.count("\n") + 1)
+        self.assertEqual(self.ledger()[-1]["kind"], kind)
+        return file_info
+
+    def test_compacted_result_ledger_telemetry_and_snapshot(self):
         text = python_module()
         reply = self.result(text)
-        out = reply["hookSpecificOutput"]
-        file_info = out["updatedToolOutput"]["file"]
-        check_exact(self, text, file_info["content"].split("\n"))
-        self.assertEqual(file_info["numLines"], file_info["content"].count("\n") + 1)
-        self.assertNotIn("truncatedByTokenCap", file_info)
-        self.assertEqual(file_info["totalLines"], text.count("\n") + 1)
-        note = out["additionalContext"]
-        self.assertTrue(note.startswith("Ork Meter compacted this read of /work/module.py: "))
-        self.assertNotIn("\n", note)
-        snapshot = note.rsplit("Original: ", 1)[1]
-        self.assertEqual(Path(snapshot).read_text(encoding="utf-8"), text)
+        file_info = self.emitted(reply, text)
+        content = file_info["content"]
+        # The compactor's view (exact at every line number, tests/Compaction) loses its markers and empty
+        # slots at the emission boundary: what the model receives is shorter than the file and renumbered.
+        self.assertLess(file_info["numLines"], file_info["totalLines"])
+        self.assertIn("def helper_0(value):", content)
+        self.assertNotIn("total_38_0", content, "a late body is elided")
+        [snapshot] = (self.scratch / "ork-meter" / "tool-output").glob("*.txt")
+        self.assertEqual(snapshot.read_text(encoding="utf-8"), text, "the original is kept for recovery")
         [row] = self.ledger()
         self.assertEqual(row["kind"], "read_compact")
         self.assertEqual(row["path_sha256"], hashlib.sha256(b"/work/module.py").hexdigest())
         self.assertEqual(row["bytes_before"], len(text.encode()))
-        self.assertEqual(row["bytes_after"], len(file_info["content"].encode()) + len(note.encode()))
+        # native_text.reconcile_records charges the row for the emitted text, not the hook's candidate plus note.
+        self.assertEqual(row["bytes_after"], len(content.encode()))
+        self.assertIs(row["native_text_boundary_reconciled"], True)
+        self.assertEqual(row["est_tokens_after"], ledger.est_tokens(row["bytes_after"]))
+        self.assertEqual(row["est_tokens_avoided"], row["est_tokens_before"] - row["est_tokens_after"])
         self.assertGreater(row["lines_elided"], 0)
         self.assertEqual(row["est_tokens_before"], -(-row["bytes_before"] // 4))
         self.assertNotIn("helper", json.dumps(row))
         self.assertNotIn("/work/module.py", json.dumps(row))
+        [invocation] = self.telemetry()
+        self.assertEqual((invocation["hook"], invocation["decision"], invocation["reason"], invocation["stdout_emitted"]),
+                         ("dedupe-reads", "applied", "reply-emitted", True))
+        self.assertEqual(invocation["bytes_after"], hook_telemetry.size(reply["hookSpecificOutput"]["updatedToolOutput"]))
+        self.assertNotIn("/work/module.py", json.dumps(invocation))
 
     def test_compact_off_and_guard_off_leave_the_read_budget(self):
         text = python_module()
         for env in ({"ORK_METER_READ_COMPACT": "off"}, {"ORK_METER_READ_GUARD": "off"}):
-            reply = self.result(text, env=env)
-            self.assertIn("Ork Meter trimmed this Read", reply["hookSpecificOutput"]["additionalContext"], env)
+            # The "Ork Meter trimmed this Read" note is not emitted (clean_reply): the trim shows in the ledger.
+            self.head(self.result(text, env=env), text, "trim")
         self.assertEqual([row["kind"] for row in self.ledger()], ["trim", "trim"])
 
     def test_trim_off_turns_everything_off(self):
@@ -385,7 +440,11 @@ class Hooks(unittest.TestCase):
     def test_a_result_cut_short_by_claude_code_is_left_to_the_read_budget(self):
         text = python_module()
         reply = self.result(text, truncatedByTokenCap=True, totalLines=5000)
-        self.assertIn("Ork Meter trimmed this Read", reply["hookSpecificOutput"]["additionalContext"])
+        out = reply["hookSpecificOutput"]
+        self.assertNotIn("additionalContext", out)
+        shown = out["updatedToolOutput"]["file"]["content"].split("\n")
+        self.assertEqual(shown, text.split("\n")[:len(shown)], "trimmed to its head, not compacted")
+        self.assertEqual([row["kind"] for row in self.ledger()], ["trim"])
 
     def test_under_the_threshold_the_read_budget_applies_as_before(self):
         text = python_module(functions=6)
@@ -396,39 +455,32 @@ class Hooks(unittest.TestCase):
         self.calls = 0
         self.scratch = self.root / "fresh"
         reply = self.result(text, env={"ORK_METER_TRIM_BUDGET_READ": "1k"})
-        context = reply["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("Ork Meter trimmed this Read", context)
-        self.assertNotIn("compacted", context)
+        self.head(reply, text, "trim")   # trimmed, not compacted: the ledger says which
+        self.assertEqual([row["kind"] for row in self.ledger()], ["trim"])
 
     def test_no_fit_pages_like_the_guard_with_the_compacted_size(self):
         text = "".join("note %04d %s\n" % (i, "configuration " * 7) for i in range(600))
         reply = self.result(text, path="/work/notes.txt", env={"ORK_METER_READ_GUARD_BYTES": "32k"})
-        out = reply["hookSpecificOutput"]
-        self.assertEqual(out["updatedToolOutput"]["file"]["content"], "\n".join(text.split("\n")[:300]))
-        self.assertEqual(out["updatedToolOutput"]["file"]["numLines"], 300)
-        self.assertIs(out["updatedToolOutput"]["file"]["truncatedByTokenCap"], True)
-        self.assertIn("Ork Meter read guard: /work/notes.txt is 64 KiB and 601 lines, about", out["additionalContext"])
-        self.assertIn("compacted, it is still about", out["additionalContext"])
-        self.assertIn("over the 6000-token threshold", out["additionalContext"])
-        self.assertIn("offset=301", out["additionalContext"])
+        # The guard's note (size, compacted size, threshold, offset=301) is not emitted; the page is, and
+        # truncatedByTokenCap, which the tool did not send, is dropped by source_output.
+        file_info = self.head(reply, text, "read_guard")
+        self.assertEqual(file_info["numLines"], 300)
         self.assertEqual([row["kind"] for row in self.ledger()], ["read_guard"])
 
     def test_no_fit_under_the_guard_threshold_is_trimmed_with_the_compacted_size(self):
         text = "".join("note %04d %s\n" % (i, "configuration " * 7) for i in range(600))
         reply = self.result(text, path="/work/notes.txt")
-        context = reply["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("Ork Meter trimmed this Read", context)
-        self.assertIn("Ork Meter compacted this Read first: compacted, it is still about", context)
+        # Neither the trim note nor "compacted this Read first" is emitted: a trim row is.
+        self.head(reply, text, "trim")
         self.assertEqual([row["kind"] for row in self.ledger()], ["trim"])
 
     def test_python_no_fit_falls_back_to_the_outline_page(self):
         text = python_module(functions=60, body=22)
         reply = self.result(text, env={"ORK_METER_READ_GUARD_TOKENS": "1000"})
-        out = reply["hookSpecificOutput"]
-        self.assertEqual(out["updatedToolOutput"]["file"]["numLines"], 48)
-        self.assertIn("Python AST outline", out["additionalContext"])
-        self.assertIn("FunctionDef helper_59", out["additionalContext"])
-        self.assertIn("over the 1000-token threshold", out["additionalContext"])
+        # The Python AST outline was additionalContext: it is not emitted. The guard page is, as a read_guard row.
+        file_info = self.head(reply, text, "read_guard")
+        self.assertEqual(file_info["numLines"], 48)
+        self.assertNotIn("FunctionDef", json.dumps(reply))
 
     def test_one_reply_per_read_and_a_repeat_is_compacted_again_not_stubbed(self):
         text = python_module()
@@ -518,25 +570,41 @@ class Hooks(unittest.TestCase):
         name = write_guard.locate(env, str(path))
         return None if name is None else write_guard._read(write_guard._path(env, name, ".json"))
 
+    def view_ranges(self, path, session_id=None):
+        """The elided ranges ``(first, last)``, 1-based like the markers were, that the write-guard record
+        holds for a session's view (the record keeps them 0-based)."""
+        record = self.record(path)
+        view = write_guard.view_key({"session_id": session_id or self.session_id})
+        return [(first + 1, last + 1) for first, last, _label in record["views"][view]]
+
     def compacted_file(self):
+        """A compacted Read of module.py: ``shown`` is what the model receives
+        (the markers and empty slots are gone at the emission boundary), so
+        the elided ranges come from the write-guard record, not the markers."""
         path = self.root / "module.py"
         text = python_module()
         path.write_bytes(text.encode("utf-8"))
         reply = self.result(text, path=str(path))
-        shown = reply["hookSpecificOutput"]["updatedToolOutput"]["file"]["content"].split("\n")
-        ranges = [tuple(int(n) for n in line.split(" ")[2].split("\u2013")) for line in markers(shown)]
-        return path, text, shown, ranges, reply["hookSpecificOutput"]["additionalContext"]
+        shown = self.emitted(reply, text)["content"].split("\n")
+        self.assertEqual(self.ledger()[-1]["kind"], "read_compact")
+        return path, text, shown, self.view_ranges(path), reply
 
-    def test_the_note_says_partial_view_and_lists_the_ranges(self):
-        _path, _text, _shown, ranges, note = self.compacted_file()
-        self.assertIn("it is a PARTIAL view", note)
-        self.assertIn("%d\u2013%d function" % ranges[0], note)
-        self.assertIn("Never rewrite this file with Write from this view", note)
-        self.assertIn("replace_all also changes elided lines", note)
-        self.assertIn("Read it with offset and limit", note)
+    def test_no_note_reaches_the_model_the_record_and_ledger_hold_the_ranges(self):
+        # The "PARTIAL view ... Never rewrite this file with Write" note is not emitted (clean_reply drops
+        # additionalContext): the view's ranges live in the write-guard record, their size in the ledger.
+        path, text, shown, ranges, reply = self.compacted_file()
+        self.assertNotIn("PARTIAL", json.dumps(reply))
+        self.assertNotIn("Ork Meter", json.dumps(reply))
+        self.assertGreater(len(ranges), 1)
+        labels = [label for _f, _l, label in self.record(path)["views"][write_guard.view_key({"session_id": "compact"})]]
+        self.assertTrue(all(label.startswith("function helper_") for label in labels), labels)
+        [row] = self.ledger()
+        self.assertEqual(row["lines_elided"], sum(last - first + 1 for first, last in ranges))
+        for first, last in ranges:
+            self.assertFalse(set(text.split("\n")[first - 1:last]) - {""} & set(shown), "elided lines are not shown")
 
     def test_a_write_rebuilt_from_the_compacted_view_is_denied_until_the_ranges_are_read(self):
-        path, text, shown, ranges, _note = self.compacted_file()
+        path, text, shown, ranges, _reply = self.compacted_file()
         folder = Path(write_guard.directory(self.env_for_index()))
         records = [json.loads(p.read_text()) for p in folder.glob("*.json")]
         self.assertEqual(len(records), 1, "one record file per guarded file")
@@ -546,25 +614,22 @@ class Hooks(unittest.TestCase):
         self.assertEqual(set(records[0]["aliases"]), set(write_guard.aliases(str(path))))
         self.assertNotIn(str(path), json.dumps(records))
         self.assertNotIn("total_8_0", json.dumps(records), "line hashes, no line text (labels name the symbols)")
-        rebuilt = "\n".join(line for line in shown if not line.startswith("\u2026"))
-        reply = self.write(path, rebuilt)
-        out = reply["hookSpecificOutput"]
-        self.assertEqual(out["permissionDecision"], "deny")
-        self.assertIn("would delete lines of it you have not seen: %d\u2013%d" % ranges[0], out["permissionDecisionReason"])
-        self.assertIn("you have not seen with offset and limit", out["permissionDecisionReason"])
+        rebuilt = self.rebuilt(shown)
+        # The reason ("would delete lines of it you have not seen: a\u2013b ... with offset and limit") is dropped by
+        # clean_reply: the denial is bare, and the record says which lines are still unread.
+        self.guarded(self.write(path, rebuilt), path, text, ranges[0])
         self.assertIsNone(self.write(path, text + "\n# appended\n"), "a Write keeping every elided line is allowed")
         for first, last in ranges[:-1]:
             self.assertIsNone(self.ranged(path, text, first, last - first + 1))
-        reply = self.write(path, rebuilt)
-        self.assertIn("function helper_39 body", reply["hookSpecificOutput"]["permissionDecisionReason"])
-        self.assertNotIn("%d\u2013%d" % ranges[0], reply["hookSpecificOutput"]["permissionDecisionReason"])
+        self.guarded(self.write(path, rebuilt), path, text, ranges[-1])   # helper_39's body, the last range
+        self.assertFalse(self.nonblank(text, *ranges[0]) & self.unread(path), "the first range was read")
         first, last = ranges[-1]
         self.ranged(path, text, first, last - first + 1)
         self.assertIsNone(self.write(path, rebuilt), "every elided range read: the Write goes through")
 
     def test_the_guard_follows_the_file_and_lets_go_when_it_was_read_whole(self):
-        path, text, shown, _ranges, _note = self.compacted_file()
-        rebuilt = "\n".join(line for line in shown if not line.startswith("\u2026"))
+        path, text, shown, _ranges, _reply = self.compacted_file()
+        rebuilt = self.rebuilt(shown)
         self.calls += 1
         self.result(text, path=str(path))   # compacted again: a fresh record
         self.assertIsNotNone(self.write(path, rebuilt))
@@ -590,41 +655,52 @@ class Hooks(unittest.TestCase):
         return {n for n in range(first, last + 1) if lines[n - 1].strip()}
 
     def rebuilt(self, shown):
+        """A Write of the file as the model received it (no marker survives the boundary; kept for safety)."""
         return "\n".join(line for line in shown if not line.startswith("\u2026"))
 
-    def reason(self, reply):
+    def denied(self, reply):
+        """A refused Write: hook.denied's permissionDecisionReason is dropped by clean_reply, so only the
+        bare deny is emitted; returns the hookSpecificOutput."""
         self.assertIsNotNone(reply, "the Write must be refused")
-        self.assertEqual(reply["hookSpecificOutput"]["permissionDecision"], "deny")
-        return reply["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertEqual(sorted(reply), ["hookSpecificOutput"])
+        out = reply["hookSpecificOutput"]
+        self.assertEqual(out["permissionDecision"], "deny")
+        self.assertEqual(sorted(out), ["hookEventName", "permissionDecision"])
+        return out
+
+    def guarded(self, reply, path, text, span):
+        """A refused Write whose reason used to name ``span``: the record still holds every line of it unread."""
+        self.denied(reply)
+        self.assertLessEqual(self.nonblank(text, *span), self.unread(path), "the range %d\u2013%d is unread" % span)
 
     def test_bypass_1_an_edit_inside_an_elided_range_keeps_it_guarded(self):
-        path, text, shown, ranges, _note = self.compacted_file()
+        path, text, shown, ranges, _reply = self.compacted_file()
         first, last = ranges[-2]
         lines = text.split("\n")
         # One exact line found by Grep, edited: the range's whole text no longer matches.
         lines[first + 2] = lines[first + 2] + "  # edited"
         path.write_text("\n".join(lines))
-        self.reason(self.write(path, self.rebuilt(shown)))
+        self.denied(self.write(path, self.rebuilt(shown)))
         self.assertLessEqual(self.nonblank(text, first, last), self.unread(path), "every line of the range, the edited one too")
 
     def test_bypass_1_replace_all_across_the_file_keeps_the_ranges_guarded(self):
-        path, text, shown, ranges, _note = self.compacted_file()
+        path, text, shown, ranges, _reply = self.compacted_file()
         renamed = text.replace("value", "amount")
         path.write_text(renamed)
         view = [line.replace("value", "amount") for line in shown]
-        self.reason(self.write(path, self.rebuilt(view)))
+        self.denied(self.write(path, self.rebuilt(view)))
         expected = set().union(*(self.nonblank(text, first, last) for first, last in ranges))
         # Every elided line is still unread; a shown line renamed in the same block may be too (conservative).
         self.assertLessEqual(expected, self.unread(path), "renamed in place: every elided line still unread")
 
     def test_bypass_2_stale_offsets_after_a_shift_mark_only_the_lines_read(self):
-        path, text, shown, ranges, _note = self.compacted_file()
+        path, text, shown, ranges, _reply = self.compacted_file()
         shifted = "".join("# inserted %d\n" % i for i in range(5)) + text
         path.write_text(shifted)
         first, last = ranges[-2]
         # The model reads the range by its stale marker offsets: those are five lines short of it now.
         self.ranged(path, shifted, first, last - first + 1)
-        self.reason(self.write(path, self.rebuilt(["# inserted %d" % i for i in range(5)] + shown)))
+        self.denied(self.write(path, self.rebuilt(["# inserted %d" % i for i in range(5)] + shown)))
         moved = {n + 5 for n in self.nonblank(text, first, last)}
         unread = self.unread(path)
         self.assertEqual(moved & unread, {n for n in moved if n > last}, "only the lines the stale Read returned are read")
@@ -632,28 +708,28 @@ class Hooks(unittest.TestCase):
         self.assertFalse(moved & self.unread(path))
 
     def test_bypass_3_another_session_of_the_same_file_is_guarded(self):
-        path, text, shown, ranges, _note = self.compacted_file()
+        path, text, shown, ranges, _reply = self.compacted_file()
         self.scratch = self.root / "forked-session"   # a fork: another session id and store
-        self.assertIn("%d\u2013%d" % ranges[0], self.reason(self.write(path, self.rebuilt(shown), session_id="fork")))
+        self.guarded(self.write(path, self.rebuilt(shown), session_id="fork"), path, text, ranges[0])
 
     def test_bypass_4_another_spelling_of_the_path_is_guarded(self):
-        path, text, shown, ranges, _note = self.compacted_file()
+        path, text, shown, ranges, _reply = self.compacted_file()
         upper = path.with_name(path.name.upper())
         spellings = [str(path.parent / "." / path.name)]
         if upper.exists():   # a case-insensitive disk (macOS, Windows): MODULE.PY is module.py
             spellings.append(str(upper))
         for spelling in spellings:
-            self.assertIn("%d\u2013%d" % ranges[0], self.reason(self.write(spelling, self.rebuilt(shown))))
+            self.guarded(self.write(spelling, self.rebuilt(shown)), path, text, ranges[0])
 
     def test_an_edit_replacing_the_file_by_rename_keeps_it_guarded(self):
-        path, text, shown, ranges, _note = self.compacted_file()
+        path, text, shown, ranges, _reply = self.compacted_file()
         replacement = path.with_suffix(".tmp")
         replacement.write_text(text.replace("CONSTANT_1 = 1", "CONSTANT_1 = 10"))
         os.replace(replacement, path)   # an atomic write: a new inode
-        self.assertIn("%d\u2013%d" % ranges[0], self.reason(self.write(path, self.rebuilt(shown))))
+        self.guarded(self.write(path, self.rebuilt(shown)), path, text, ranges[0])
 
     def test_grep_and_bash_output_that_shows_lines_marks_them_read(self):
-        path, text, shown, ranges, _note = self.compacted_file()
+        path, text, shown, ranges, _reply = self.compacted_file()
         lines = text.split("\n")
         first, last = ranges[0]
         trim = load("hooks/trim-tool-output.py")
@@ -668,7 +744,7 @@ class Hooks(unittest.TestCase):
         grep = "\n".join("%d:%s" % (n, lines[n - 1]) for n in range(first, first + 5))
         post("Grep", {"pattern": "total", "path": str(path), "-n": True, "output_mode": "content"},
              {"mode": "content", "numFiles": 1, "filenames": [], "content": grep, "numLines": 5})
-        self.reason(self.write(path, self.rebuilt(shown)))
+        self.denied(self.write(path, self.rebuilt(shown)))
         unread = self.unread(path)
         self.assertFalse(self.nonblank(text, first, first + 4) & unread, "Grep -n lines read")
         self.assertLessEqual(self.nonblank(text, first + 5, last), unread, "the rest of the range not")
@@ -683,49 +759,51 @@ class Hooks(unittest.TestCase):
         self.assertFalse(self.nonblank(text, second_first, second_last) & self.unread(path), "sed -n lines read")
 
     def test_the_override_switch_lets_a_write_through(self):
-        path, text, shown, ranges, _note = self.compacted_file()
+        path, text, shown, ranges, _reply = self.compacted_file()
         self.assertIsNotNone(self.write(path, self.rebuilt(shown)))
         self.scratch = self.root / "next-session"   # a switch turned on applies from the next session
         self.assertIsNone(self.write(path, self.rebuilt(shown), env={"ORK_METER_WRITE_GUARD_OVERRIDE": "on"},
                                      session_id="next"))
 
     def test_the_guard_needs_no_snapshot_and_fails_closed(self):
-        path, text, shown, _ranges, _note = self.compacted_file()
+        path, text, shown, _ranges, _reply = self.compacted_file()
         for snapshot in (self.scratch / "ork-meter" / "tool-output").glob("*"):
             snapshot.unlink()
         self.assertEqual(self.write(path, "short")["hookSpecificOutput"]["permissionDecision"], "deny",
                          "the record holds its own line hashes; a Write that keeps nothing is refused too")
         with patch.object(write_guard, "deleted", side_effect=RuntimeError("boom")):
             reply = self.write(path, "short")
-        self.assertIn("could not check it", reply["hookSpecificOutput"]["permissionDecisionReason"])
+        self.denied(reply)   # fails closed; the "could not check it" reason is dropped by clean_reply
 
     def test_a_corrupt_record_is_a_tombstone_that_no_edit_clears(self):
-        path, text, shown, _ranges, _note = self.compacted_file()
+        path, text, shown, _ranges, _reply = self.compacted_file()
         env = self.env_for_index()
         record_file = Path(write_guard._path(env, write_guard.locate(env, str(path)), ".json"))
         record_file.write_text("{not json")
-        for attempt in range(3):   # every retry is refused, not only the first
-            self.assertIn("was unreadable", self.reason(self.write(path, "short")), attempt)
+        for attempt in range(3):   # every retry is refused, not only the first (the "was unreadable" reason is not emitted)
+            self.denied(self.write(path, "short"))
         self.assertTrue(self.record(path)["tombstone"])
         # The model's own one-line Edit, as the refusal suggests: the tombstone stays.
         path.write_text(text.replace("CONSTANT_1 = 1", "CONSTANT_1 = 10"))
-        self.assertIn("was unreadable", self.reason(self.write(path, self.rebuilt(shown))))
+        self.denied(self.write(path, self.rebuilt(shown)))
+        self.assertTrue(self.record(path)["tombstone"])
         # A whole delivery to another session clears it for that session only.
         write_guard.forget(env, str(path), write_guard.view_key({"session_id": "other"}))
         self.assertIsNone(self.write(path, "short", session_id="other"))
-        self.assertIn("was unreadable", self.reason(self.write(path, self.rebuilt(shown))))
+        self.denied(self.write(path, self.rebuilt(shown)))
+        self.assertTrue(self.record(path)["tombstone"])
         # A whole delivery to this session clears it here.
         write_guard.forget(env, str(path), write_guard.view_key({"session_id": self.session_id}))
         self.assertIsNone(self.write(path, "short"))
 
     def test_a_busy_record_lock_refuses_the_write_and_skips_marking(self):
-        path, text, shown, ranges, _note = self.compacted_file()
+        path, text, shown, ranges, _reply = self.compacted_file()
         env = self.env_for_index()
         lock = Path(write_guard._path(env, write_guard.locate(env, str(path)), ".lock"))
         lock.write_text("")
         try:
             with patch.object(write_guard, "WRITE_LOCK_WAIT", 0.05):
-                self.assertIn("its record is busy", self.reason(self.write(path, text)))
+                self.denied(self.write(path, text))   # the whole text, refused only because the record is busy
             first, last = ranges[0]
             self.ranged(path, text, first, last - first + 1)   # skipped, not unlocked
         finally:
@@ -742,8 +820,10 @@ class Hooks(unittest.TestCase):
         shown = reply["hookSpecificOutput"]["updatedToolOutput"]["file"]["content"].split("\n")
         rebuilt = self.rebuilt(shown)
         self.assertEqual(sum(1 for line in rebuilt.split("\n") if "identical line 0" in line), 1, "one body shown")
-        reason = self.reason(self.write(path, rebuilt))
-        self.assertIn("function second body", reason)
+        self.denied(self.write(path, rebuilt))
+        # The reason named "function second body"; the record's view carries that label now.
+        labels = [label for _f, _l, label in self.record(path)["views"][write_guard.view_key({"session_id": "compact"})]]
+        self.assertEqual(labels, ["function second body"])
 
     def test_alignment_counts_position_and_multiplicity(self):
         lines = ["def a():", "    x = 1", "}", "}", "def b():", "    x = 1", "}", "}"]
@@ -757,7 +837,7 @@ class Hooks(unittest.TestCase):
         self.assertEqual(write_guard.deleted(record, unread, "\n".join(lines[:5] + ["    x = 1", "}", "}", "# more"])), {})
 
     def test_views_are_per_session_and_a_whole_read_clears_only_its_own(self):
-        path, text, shown, ranges, _note = self.compacted_file()
+        path, text, shown, ranges, _reply = self.compacted_file()
         # Session "other" compacts the same file too: two views.
         self.calls += 1
         other_scratch, self.scratch = self.scratch, self.root / "other-session"
@@ -768,19 +848,18 @@ class Hooks(unittest.TestCase):
                                                "ORK_METER_TRIM_BUDGET_READ": "1024k"})
         self.assertIsNone(self.write(path, self.rebuilt(shown), session_id="other"), "other holds the whole file")
         self.scratch, self.session_id = other_scratch, "compact"
-        self.assertIn("%d\u2013%d" % ranges[0], self.reason(self.write(path, self.rebuilt(shown))), "compact still guarded")
-        self.assertIn("%d\u2013%d" % ranges[0], self.reason(self.write(path, self.rebuilt(shown), session_id="fork")),
-                      "a session without a view gets the strictest")
+        self.guarded(self.write(path, self.rebuilt(shown)), path, text, ranges[0])   # compact still guarded
+        # A session without a view gets the strictest.
+        self.guarded(self.write(path, self.rebuilt(shown), session_id="fork"), path, text, ranges[0])
 
     def test_a_subagent_has_its_own_view(self):
-        path, text, shown, ranges, _note = self.compacted_file()
+        path, text, shown, ranges, _reply = self.compacted_file()
         first, last = ranges[0]
         view = write_guard.view_key({"session_id": self.session_id, "agent_id": "sub"})
         write_guard.observe(self.env_for_index(), str(path), view, start=first, shown=text.split("\n")[first - 1:last])
         record = self.record(path)
         self.assertFalse(self.nonblank(text, first, last) & {i + 1 for i in write_guard.unread_for(record, view)})
-        self.assertIn("%d\u2013%d" % ranges[0], self.reason(self.write(path, self.rebuilt(shown))),
-                      "the parent's view is not cleared by its subagent's read")
+        self.guarded(self.write(path, self.rebuilt(shown)), path, text, ranges[0])   # the parent's view is not cleared by its subagent's read
 
     def test_the_counting_pre_check_and_the_size_cap(self):
         lines = ["line %d" % i for i in range(12000)]
@@ -797,8 +876,7 @@ class Hooks(unittest.TestCase):
         path.write_text("\n".join(lines))
         env = self.env_for_index()
         write_guard.remember(env, str(path), "\n".join(lines), [(11001, 11002, "tail")], "v")
-        reason = self.reason(self.write(path, "\n".join(lines) + "\nmore"))
-        self.assertIn("too long to compare", reason)
+        self.denied(self.write(path, "\n".join(lines) + "\nmore"))   # "too long to compare" is not emitted: a bare deny
 
     def test_alignment_of_10k_lines_stays_quick(self):
         lines = ["    value_%d = %d" % (i % 300, i % 7) for i in range(write_guard.MAX_ALIGN_LINES)]
@@ -808,12 +886,12 @@ class Hooks(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 3.0, "well within the hook's 5 s limit")
 
     def test_any_look_keeps_a_record_alive(self):
-        path, text, shown, ranges, _note = self.compacted_file()
+        path, text, shown, ranges, _reply = self.compacted_file()
         env = self.env_for_index()
         record_file = Path(write_guard._path(env, write_guard.locate(env, str(path)), ".json"))
         old = time.time() - write_guard.MAX_AGE_SECONDS + 3600
         os.utime(record_file, (old, old))
-        self.reason(self.write(path, self.rebuilt(shown)))   # a Write check touches it
+        self.denied(self.write(path, self.rebuilt(shown)))   # a Write check touches it
         write_guard.expire(env, now=time.time() + 7200)
         self.assertIsNotNone(self.record(path), "looked at an hour ago by the clock: still alive")
         self.assertEqual(write_guard.MAX_AGE_SECONDS, 30 * 24 * 3600)
@@ -858,10 +936,9 @@ class Hooks(unittest.TestCase):
         self.assertEqual(sum(1 for path in paths if self.record(path)), 0, "after the age limit they go")
 
     def test_the_guard_keeps_guarding_in_shadow_and_off_modes(self):
-        path, text, shown, ranges, _note = self.compacted_file()
+        path, text, shown, ranges, _reply = self.compacted_file()
         for mode in ("shadow", "off"):
-            self.assertIn("%d\u2013%d" % ranges[0],
-                          self.reason(self.write(path, self.rebuilt(shown), env={"ORK_METER_MODE": mode})), mode)
+            self.guarded(self.write(path, self.rebuilt(shown), env={"ORK_METER_MODE": mode}), path, text, ranges[0])
         first, last = ranges[0]
         self.ranged(path, text, first, last - first + 1, env={"ORK_METER_MODE": "off"})
         self.assertFalse(self.nonblank(text, first, last) & self.unread(path), "the observer marks reads in off mode")
@@ -871,18 +948,16 @@ class Hooks(unittest.TestCase):
         text = "".join("note %04d %s\n" % (i, "configuration " * 7) for i in range(600))
         path.write_text(text)
         reply = self.result(text, path=str(path), env={"ORK_METER_READ_GUARD_BYTES": "32k"})
-        self.assertIn("refuses a Write of this file", reply["hookSpecificOutput"]["additionalContext"])
-        page = reply["hookSpecificOutput"]["updatedToolOutput"]["file"]["content"]
-        denied = self.write(path, page)
-        self.assertIn("301\u2013600 lines after the page", denied["hookSpecificOutput"]["permissionDecisionReason"])
+        # The note ("refuses a Write of this file") and the refusal's "301–600 lines after the page" are not
+        # emitted; the page is, the Write of it is denied, and the record holds the lines after the page.
+        page = self.head(reply, text, "read_guard")["content"]
+        self.guarded(self.write(path, page), path, text, (301, 600))
 
     def test_compaction_is_off_by_default_and_the_guard_still_pages(self):
         env = {key: value for key, value in self.env.items() if key != "ORK_METER_READ_COMPACT"}
         text = python_module()
         self.env = env
-        reply = self.result(text)
-        self.assertIn("Ork Meter trimmed this Read", reply["hookSpecificOutput"]["additionalContext"])
-        self.assertNotIn("compacted", reply["hookSpecificOutput"]["additionalContext"])
+        self.head(self.result(text), text, "trim")   # trimmed, not compacted: no note either way, the ledger says
         self.assertEqual([row["kind"] for row in self.ledger()], ["trim"])
         self.assertFalse(guard.deferred(self.context(), text.encode(), ".py"))
         path = self.root / "module.py"

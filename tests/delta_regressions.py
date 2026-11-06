@@ -21,6 +21,7 @@ import features  # noqa: E402
 import hook  # noqa: E402
 import ledger  # noqa: E402
 import session  # noqa: E402
+import trimmer  # noqa: E402
 
 
 def pytest_output(failing, seconds):
@@ -99,8 +100,31 @@ class DeltaTests(StoreCase):
                                                               "startLine": 1, "totalLines": total_lines or lines}}}
         return self.invoke(self.read, payload, env)
 
-    def delivered(self, reply, fallback):
-        return reply["hookSpecificOutput"]["updatedToolOutput"]["stdout"] if reply else fallback
+    # Dan's emission boundary (hooks/lib/native_text.py clean_reply / source_output)
+    # drops additionalContext and every plugin-authored line from a reply, so
+    # the savings ledger is where a delivery's kind is still visible.
+    def rows(self, kind):
+        return [r for r in ledger.load(self.store) if r["kind"] == kind]
+
+    def assert_no_context(self, reply):
+        self.assertNotIn("additionalContext", reply["hookSpecificOutput"])
+
+    def assert_delta(self, reply, tool="Bash", hunks=None):
+        """The reply carries no note; the last ledger row is a delta, reconciled
+        (native_text.reconcile_records) against the emitted text."""
+        self.assert_no_context(reply)
+        row = ledger.load(self.store)[-1]
+        self.assertEqual((row["kind"], row["tool"], row.get("native_text_boundary_reconciled")), ("delta", tool, True))
+        if hunks is not None:
+            self.assertEqual(row["hunks"], hunks)
+        return row
+
+    def assert_dedupe(self, reply):
+        """A repeated Read is its first lines, without the "is unchanged since" note."""
+        self.assert_no_context(reply)
+        self.assertEqual(reply["hookSpecificOutput"]["updatedToolOutput"]["file"]["numLines"], trimmer.FIRST_LINES)
+        row = ledger.load(self.store)[-1]
+        self.assertEqual((row["kind"], row["tool"], row.get("native_text_boundary_reconciled")), ("dedupe", "Read", True))
 
     # --- lever --------------------------------------------------------------
 
@@ -113,10 +137,8 @@ class DeltaTests(StoreCase):
     def test_default_off_leaves_reruns_on_the_ordinary_path(self):
         first, second = pytest_output(["test_beta"], 0.81), pytest_output([], 0.79)
         self.run_bash(first, env={})
-        reply = self.run_bash(second, env={})
-        stdout = reply["hookSpecificOutput"]["updatedToolOutput"]["stdout"] if reply else second
-        self.assertNotIn("Ork Meter delta", stdout)
-        self.assertFalse(any(r["kind"] == "delta" for r in ledger.load(self.store)))
+        self.run_bash(second, env={})
+        self.assertEqual(self.rows("delta"), [])
 
     # --- Bash re-runs -------------------------------------------------------
 
@@ -126,21 +148,25 @@ class DeltaTests(StoreCase):
         self.run_bash(first)
         reply = self.run_bash(second)
         stdout = reply["hookSpecificOutput"]["updatedToolOutput"]["stdout"]
-        self.assertIn("Ork Meter delta", stdout)
-        self.assertIn("+tests/test_suite.py::test_beta PASSED", stdout)
-        self.assertIn("-tests/test_suite.py::test_beta FAILED", stdout)
+        # The boundary (native_text.source_text) strips the "Ork Meter delta" note,
+        # the "Full output:" line, the diff headers and every '-' line; the '+'
+        # and ' ' lines reach the model as this run's own lines, in order.
+        self.assertIn("tests/test_suite.py::test_beta PASSED", stdout)
+        self.assertNotIn("test_beta FAILED", stdout)
         self.assertNotIn("test_stable[17]", stdout)
+        self.assertNotIn("Ork Meter", stdout)
         self.assertLess(len(stdout.encode()), len(second.encode()) // 4)
-        # The diff is exact: applying it to the earlier stdout reproduces this run.
-        diff = stdout[stdout.index("--- earlier run"):stdout.index("\nFull output:")].split("\n")
-        self.assertEqual(apply_unified(first, diff), second)
-        # The full output is recoverable, and the ledger has a delta row.
-        path = stdout.rsplit("Full output: ", 1)[1].split(" (")[0]
-        self.assertEqual(Path(path).read_text(encoding="utf-8"), second)
-        rows = [r for r in ledger.load(self.store) if r["kind"] == "delta"]
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["tool"], "Bash")
-        self.assertNotIn("pytest", json.dumps(rows))
+        self.assertTrue(set(stdout.split("\n")) <= set(second.split("\n")), stdout)
+        # The diff the hook rendered is exact: applying it to the earlier stdout reproduces this run.
+        diff, info = delta.render(first, second, "earlier run", "this run")
+        self.assertEqual(apply_unified(first, diff.split("\n")), second)
+        # The full output is on disk, and the ledger has one delta row charged for the emitted text.
+        saved = list((self.scratch / "ork-meter" / session.TOOL_OUTPUT_DIR).glob("*.txt"))
+        self.assertEqual([p.read_text(encoding="utf-8") for p in saved], [second])
+        row = self.assert_delta(reply, hunks=info["hunks"])
+        self.assertEqual(len(self.rows("delta")), 1)
+        self.assertEqual(row["bytes_after"], len(stdout.encode()))
+        self.assertNotIn("pytest", json.dumps(ledger.load(self.store)))
 
     def test_the_smaller_of_delta_and_test_filter_is_delivered(self):
         env = {"ORK_METER_DELTA": "on"}
@@ -156,34 +182,43 @@ class DeltaTests(StoreCase):
         build = "".join("compiling module_%03d ... warning: deprecated API in legacy adapter\n" % i for i in range(100))
         self.run_bash(build + "error: 2 errors\n", command="make all", env=env)
         reply = self.run_bash(build + "error: 1 error\n", command="make all", env=env)
-        self.assertIn("Ork Meter delta", reply["hookSpecificOutput"]["updatedToolOutput"]["stdout"])
+        stdout = reply["hookSpecificOutput"]["updatedToolOutput"]["stdout"]
+        self.assertIn("error: 1 error", stdout)       # the changed hunk, without its diff markers
+        self.assertNotIn("module_000", stdout)
+        self.assert_delta(reply, hunks=1)
 
-    def test_identical_rerun_is_one_line(self):
+    def test_identical_rerun_delivers_an_empty_stdout(self):
+        # The "identical to the earlier run" note is plugin prose, so the boundary
+        # leaves nothing of it (native_text.source_text): the stdout is empty and
+        # the 0-hunk delta row is the only record of the rerun.
         out = pytest_output(["test_beta"], 0.5)
         self.run_bash(out)
         reply = self.run_bash(out)
-        stdout = reply["hookSpecificOutput"]["updatedToolOutput"]["stdout"]
-        self.assertIn("identical to the earlier run", stdout)
-        self.assertLess(len(stdout.encode()), 800)
+        self.assertEqual(reply["hookSpecificOutput"]["updatedToolOutput"]["stdout"], "")
+        row = self.assert_delta(reply, hunks=0)
+        self.assertEqual(row["bytes_after"], 0)
 
     def test_trimmed_earlier_run_is_not_an_inline_base(self):
         first = pytest_output(["test_beta"], 0.81) * 5
         reply = self.run_bash(first)
-        self.assertIn("Full output:", reply["hookSpecificOutput"]["updatedToolOutput"]["stdout"])
-        reply = self.run_bash(first.replace("0.81s", "0.80s"))
-        self.assertNotIn("Ork Meter delta", json.dumps(reply))
-        self.assertFalse(any(row["kind"] == "delta" for row in ledger.load(self.store)))
+        stdout = reply["hookSpecificOutput"]["updatedToolOutput"]["stdout"]
+        # Trimmed, with the "Full output:" recovery line stripped at the boundary.
+        self.assertLess(len(stdout.encode()), len(first.encode()))
+        self.assertNotIn("Full output:", stdout)
+        self.assertEqual(ledger.load(self.store)[-1]["kind"], "trim")
+        self.run_bash(first.replace("0.81s", "0.80s"))
+        self.assertEqual(self.rows("delta"), [])
 
     def test_deltas_never_chain_the_run_after_a_delta_is_full(self):
         # #144: after a delta the model holds a diff, not the stdout, so the
         # next run (changed or identical) is delivered in full and becomes the base.
         self.assertIsNone(self.run_bash(pytest_output(["test_beta"], 0.81)))
-        self.assertIn("Ork Meter delta", json.dumps(self.run_bash(pytest_output(["test_beta"], 0.80))))
+        self.assert_delta(self.run_bash(pytest_output(["test_beta"], 0.80)))
         self.assertIsNone(self.run_bash(pytest_output(["test_beta"], 0.79)))
-        self.assertIn("Ork Meter delta", json.dumps(self.run_bash(pytest_output(["test_beta"], 0.78))))
+        self.assert_delta(self.run_bash(pytest_output(["test_beta"], 0.78)))
         out = pytest_output(["test_gamma"], 0.5)
         self.run_bash(out)
-        self.assertIn("identical to the earlier run", json.dumps(self.run_bash(out)))
+        self.assert_delta(self.run_bash(out), hunks=0)
         self.assertIsNone(self.run_bash(out))
 
     def assert_run_after_is_full(self, second):
@@ -191,8 +226,8 @@ class DeltaTests(StoreCase):
         # so run 3 must not be a diff against run 1.
         self.run_bash(pytest_output(["test_beta"], 0.81))
         self.assertIsNone(second())
-        third = pytest_output(["test_beta"], 0.79)
-        self.assertNotIn("Ork Meter delta", self.delivered(self.run_bash(third), third))
+        self.run_bash(pytest_output(["test_beta"], 0.79))
+        self.assertEqual(self.rows("delta"), [])     # run 3 went out whole, not as a diff
 
     def test_pass_through_run_drops_the_base(self):
         json_like = "".join(json.dumps({"test": "test_%03d" % i, "outcome": "passed"}) + "\n" for i in range(80))
@@ -215,8 +250,8 @@ class DeltaTests(StoreCase):
         self.assertIsNone(skip(pytest_output(["test_alpha"], 0.80)))
         self.assertEqual(delta.load(self.store, name), (None, None))
         between()
-        third = pytest_output(["test_alpha"], 0.79)
-        self.assertNotIn("Ork Meter delta", self.delivered(self.run_bash(third), third))
+        self.run_bash(pytest_output(["test_alpha"], 0.79))
+        self.assertEqual(self.rows("delta"), [])     # run 3 went out whole, not as a diff
 
     def test_tripped_breaker_drops_the_base(self):
         def boom(ctx):
@@ -282,7 +317,8 @@ class DeltaTests(StoreCase):
         with patch.object(delta, "invalidate", side_effect=RuntimeError("boom")):
             self.assertIsNone(self.run_bash(pytest_output(["test_beta"], 0.81), env={"ORK_METER_TRIM": "off"}))
             big = pytest_output(["test_beta"], 0.81) * 5
-            self.assertIn("Full output:", self.delivered(self.run_bash(big, env={"ORK_METER_DELTA": "off"}), ""))
+            self.assertIsNotNone(self.run_bash(big, env={"ORK_METER_DELTA": "off"}))
+            self.assertEqual(ledger.load(self.store)[-1]["kind"], "trim")   # the trim reply, minus its note
         self.assertEqual(circuit.read(self.store, circuit.scope("trim-tool-output", "Bash"))["faults"], 0)
 
     def test_only_base_keeping_hooks_load_delta(self):
@@ -330,11 +366,15 @@ class DeltaTests(StoreCase):
         (self.scratch / "ork-meter" / session.DELTA_DIR).write_text("not a directory", encoding="utf-8")
         big = pytest_output(["test_beta"], 0.81) * 5
         for _ in range(3):
-            self.assertIn("Full output:", self.delivered(self.run_bash(big), ""))
+            self.assertIsNotNone(self.run_bash(big))
+            self.assertEqual(ledger.load(self.store)[-1]["kind"], "trim")   # the trim reply, minus its note
             self.assertIsNone(self.run_bash(pytest_output(["test_beta"], 0.81)))
         large = "\n".join("line %05d " % i + "x" * 80 for i in range(400))
         reply = self.run_read("/tmp/project/big.txt", large)
-        self.assertIn("Ork Meter trimmed this Read", reply["hookSpecificOutput"]["additionalContext"])
+        # The "Ork Meter trimmed this Read" note is dropped at the boundary; the trim itself stands.
+        self.assert_no_context(reply)
+        self.assertLess(reply["hookSpecificOutput"]["updatedToolOutput"]["file"]["numLines"], 400)
+        self.assertEqual(ledger.load(self.store)[-1]["kind"], "trim")
         for scope in ("trim-tool-output:Bash", "dedupe-reads:Read"):
             self.assertEqual(circuit.read(self.store, scope)["faults"], 0)
 
@@ -352,8 +392,9 @@ class DeltaTests(StoreCase):
         first, second = pytest_output(["test_beta"], 0.81), pytest_output([], 0.79)
         self.run_bash(first)
         for kwargs in ({"command": "python3 -m pytest -v tests/other"}, {"cwd": "/tmp/other"}, {"agent": "subagent-1"}):
-            self.assertNotIn("Ork Meter delta", self.delivered(self.run_bash(second, **kwargs), second))
-        self.assertIn("Ork Meter delta", self.delivered(self.run_bash(second), second))
+            self.run_bash(second, **kwargs)
+            self.assertEqual(self.rows("delta"), [])
+        self.assert_delta(self.run_bash(second))
 
     def test_large_change_falls_back_to_ordinary_delivery(self):
         # Inside every size bound, so only the MAX_RATIO check rejects it.
@@ -363,15 +404,15 @@ class DeltaTests(StoreCase):
         self.assertGreater(len(new.encode()), delta.MIN_BYTES)
         self.assertIsNone(delta.render(old, new, "x", "y"))
         self.run_bash(old, command="./list.sh")
-        self.assertNotIn("Ork Meter delta", self.delivered(self.run_bash(new, command="./list.sh"), new))
+        self.run_bash(new, command="./list.sh")
+        self.assertEqual(self.rows("delta"), [])
 
     def test_compaction_and_new_sessions_forget_every_base(self):
         out = pytest_output(["test_beta"], 0.5)
         self.run_bash(out)
         self.invoke(self.session_hook, {"hook_event_name": "SessionStart", "source": "compact"})
-        reply = self.run_bash(out)
-        stdout = reply["hookSpecificOutput"]["updatedToolOutput"]["stdout"] if reply else out
-        self.assertNotIn("Ork Meter delta", stdout)
+        self.run_bash(out)
+        self.assertEqual(self.rows("delta"), [])
         self.invoke(self.session_hook, {"hook_event_name": "SessionStart", "source": "compact"})
         self.assertEqual(list((self.scratch / "ork-meter" / "delta-bases").glob("*")), [])
 
@@ -380,9 +421,8 @@ class DeltaTests(StoreCase):
         self.run_bash(out)
         for path in (self.scratch / "ork-meter" / "delta-bases").glob("*.txt"):
             path.write_text("something else\n" * 400, encoding="utf-8")
-        reply = self.run_bash(out)
-        stdout = reply["hookSpecificOutput"]["updatedToolOutput"]["stdout"] if reply else out
-        self.assertNotIn("Ork Meter delta", stdout)
+        self.run_bash(out)
+        self.assertEqual(self.rows("delta"), [])
 
     def test_execution_status_fields_are_preserved(self):
         first, second = pytest_output(["test_beta"], 0.81), pytest_output([], 0.79)
@@ -400,26 +440,31 @@ class DeltaTests(StoreCase):
         self.assertIsNone(self.run_read(path, source(1)))
         reply = self.run_read(path, source(2))
         out = reply["hookSpecificOutput"]
-        diff_text = out["updatedToolOutput"]["file"]["content"]
-        self.assertEqual(out["updatedToolOutput"]["file"]["numLines"], diff_text.count("\n") + 1)
-        self.assertIn("+    return route(request, 120, strict=True)", diff_text)
-        self.assertIn("@@ -481,5 +481,5 @@", diff_text)   # real file line numbers
-        self.assertEqual(apply_unified(source(1), diff_text.split("\n")), source(2))
-        # #143: additionalContext is Ork Meter's own note only, never file text.
-        context = out["additionalContext"]
-        self.assertIn("Ork Meter delta", context)
-        self.assertIn("is not the file: it is a unified diff", context)
-        self.assertNotIn("@@ -", context)
-        self.assertNotIn("route(request", context)
+        content = out["updatedToolOutput"]["file"]["content"]
+        # The boundary (native_text.source_output) keeps only the diff's '+' and
+        # ' ' lines, as the file's own lines, and recomputes numLines; the '@@'
+        # headers, the '-' lines and the explanatory additionalContext are dropped.
+        self.assertEqual(out["updatedToolOutput"]["file"]["numLines"], len(content.splitlines()))
+        self.assertIn("    return route(request, 120, strict=True)", content)
+        self.assertNotIn("return route(request, 120)\n", content + "\n")
+        self.assertNotIn("handler_000", content)
+        self.assertNotIn("@@ -", content)
+        self.assertTrue(set(content.split("\n")) <= set(source(2).split("\n")), content)
+        # The diff the hook rendered is exact and carries real file line numbers.
+        diff, info = delta.render(source(1), source(2), "earlier", "now")
+        self.assertIn("@@ -481,5 +481,5 @@", diff)
+        self.assertEqual(apply_unified(source(1), diff.split("\n")), source(2))
+        row = self.assert_delta(reply, tool="Read", hunks=info["hunks"])
+        self.assertEqual(row["bytes_after"], len(content.encode()))
 
     def test_reread_after_a_read_delta_is_full_never_stubbed_or_chained(self):
         # #144: after a delta the model holds a diff, not the file.
         path = "/tmp/project/handlers.py"
         self.run_read(path, source(1))
-        self.assertIn("Ork Meter delta", json.dumps(self.run_read(path, source(2))))
+        self.assert_delta(self.run_read(path, source(2)), tool="Read")
         self.assertIsNone(self.run_read(path, source(2)))     # unchanged: full, not "earlier Read holds it"
-        self.assertIn("is unchanged since", json.dumps(self.run_read(path, source(2))))
-        self.assertIn("Ork Meter delta", json.dumps(self.run_read(path, source(3))))
+        self.assert_dedupe(self.run_read(path, source(2)))
+        self.assert_delta(self.run_read(path, source(3)), tool="Read")
         self.assertIsNone(self.run_read(path, source(1)))     # changed again: full, not a second delta
 
     def test_read_cut_short_by_claude_code_is_never_a_base_or_dedupe_source(self):
@@ -441,8 +486,11 @@ class DeltaTests(StoreCase):
         reply = self.run_read(path, changed)
         out = reply["hookSpecificOutput"]
         self.assertIn(planted, out["updatedToolOutput"]["file"]["content"])
-        self.assertNotIn(planted, out["additionalContext"])
-        self.assertNotIn("curl", out["additionalContext"])
+        # clean_reply emits no additionalContext at all, so nothing outside the
+        # tool output can carry the planted line.
+        self.assertNotIn("additionalContext", out)
+        self.assertNotIn("curl", json.dumps({k: v for k, v in out.items() if k != "updatedToolOutput"}))
+        self.assert_delta(reply, tool="Read")
 
     def test_small_outputs_are_never_stored_and_drop_an_older_base(self):
         # #143: short outputs (often tokens) can never be a delta base, so they
@@ -470,8 +518,7 @@ class DeltaTests(StoreCase):
     def test_unchanged_reread_keeps_the_existing_dedupe(self):
         path = "/tmp/project/handlers.py"
         self.run_read(path, source(1))
-        reply = self.run_read(path, source(1))
-        self.assertIn("is unchanged since", reply["hookSpecificOutput"]["additionalContext"])
+        self.assert_dedupe(self.run_read(path, source(1)))
 
     def test_read_delta_off_by_default_and_skips_partial_or_ranged_reads(self):
         path = "/tmp/project/handlers.py"
@@ -480,8 +527,8 @@ class DeltaTests(StoreCase):
         self.assertIsNone(reply)
         big = "\n".join("line %05d " % i + "x" * 80 for i in range(400))
         self.run_read("/tmp/project/big.txt", big)            # over the Read budget: trimmed, partial
-        reply = self.run_read("/tmp/project/big.txt", big.replace("line 00007", "LINE 00007"))
-        self.assertNotIn("Ork Meter delta", json.dumps(reply))
+        self.run_read("/tmp/project/big.txt", big.replace("line 00007", "LINE 00007"))
+        self.assertEqual(self.rows("delta"), [])
         ranged = {"file_path": path, "offset": 1, "limit": 2000}
         self.run_read(path, source(1), tool_input=ranged)
         self.assertIsNone(self.run_read(path, source(2), tool_input=ranged))

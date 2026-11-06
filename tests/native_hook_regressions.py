@@ -41,8 +41,9 @@ class NativeHooks(unittest.TestCase):
         self.assertEqual(self.run_hook("trim-session.py", json.dumps(self.payload)), "")
 
     def test_startup_writes_private_session_state(self):
-        reply = json.loads(self.run_hook("trim-session.py", json.dumps(self.payload)))
-        self.assertTrue(reply["systemMessage"].startswith("Ork Meter trim: on"))
+        # The status line is stripped with every systemMessage at the emission boundary
+        # (native_text.clean_reply): a startup is silent, and its work shows in the state it wrote.
+        self.assertEqual(self.run_hook("trim-session.py", json.dumps(self.payload)), "")
         state = json.loads((self.root / "state/ork-meter/plugin-features.json").read_text())
         self.assertIn("trim", state["features"])
         self.assertTrue((self.root / "scratch/ork-meter").is_dir())
@@ -50,8 +51,11 @@ class NativeHooks(unittest.TestCase):
     def test_imports_ignore_current_directory_and_pythonpath(self):
         (self.root / "features.py").write_text('raise RuntimeError("untrusted import")\n')
         env = dict(self.env, PYTHONPATH=str(self.root))
-        reply = json.loads(self.run_hook("trim-session.py", json.dumps(self.payload), env))
-        self.assertTrue(reply["systemMessage"].startswith("Ork Meter trim: on"))
+        # Silent like every startup (clean_reply); the lever file proves the real features
+        # module ran, since the planted one raises on import.
+        self.assertEqual(self.run_hook("trim-session.py", json.dumps(self.payload), env), "")
+        state = json.loads((self.root / "state/ork-meter/plugin-features.json").read_text())
+        self.assertIn("trim", state["features"])
 
     def test_disabled_trim_does_not_write_tool_output(self):
         payload = dict(self.payload, hook_event_name="PostToolUse", tool_name="Bash",
@@ -79,7 +83,12 @@ class NativeHooks(unittest.TestCase):
         out = self.run_hook("trim-tool-output.py", json.dumps(payload), dict(self.env, ORK_METER_MODE="reduce"))
         elapsed = time.monotonic() - started
         print("\n  cold trim-tool-output wall time: %.2fs (hooks.json timeout 2s)" % elapsed, file=sys.stderr)
-        self.assertIn("Full output:", out, "no reply after %.2fs" % elapsed)
+        # The "Full output:" note is not a received line, so native_text.source_output drops it;
+        # the reply is the trimmed stdout alone.
+        self.assertTrue(out.strip(), "no reply after %.2fs" % elapsed)
+        replaced = json.loads(out)["hookSpecificOutput"]["updatedToolOutput"]
+        self.assertLess(len(replaced["stdout"]), len(stdout))
+        self.assertNotIn("Full output:", out)
 
     def test_concurrent_process_startup_keeps_every_shadow_observation(self):
         # Synchronize separate processes just before the production runner.

@@ -11,6 +11,7 @@ sys.path.insert(0, str(ROOT / "tests"))
 import host_retry  # noqa: E402
 from native_host import Fixture, Host, hook_evidence, latest_tool_results  # noqa: E402
 sys.path.insert(0, str(ROOT / "hooks/lib"))
+import ledger  # noqa: E402
 import session  # noqa: E402
 
 
@@ -84,10 +85,22 @@ class NativeOutputQualification(unittest.TestCase):
                 if tool == "Bash":
                     for evidence in ("ERROR: middle-first", "ERROR: middle-second", "fatal: separate stderr"):
                         self.assertIn(evidence, output)
-                if mode == "reduce" and not (circuit_failure and tool == "Bash"):
-                    self.assertIn("Full output:", output, tool + "; " + hook_evidence(completed.stdout, Fixture.arrivals))
-                else:
-                    self.assertNotIn("Full output:", output, tool)
+                # The "Full output: <path>" note is dropped at the emission boundary
+                # (native_text.source_output keeps only received lines): the model gets
+                # the reduced text alone; the trim's evidence is the session's ledger row.
+                self.assertNotIn("Full output:", output, tool)
+                self.assertNotIn("Ork Meter", output, tool)
+            if mode == "reduce":
+                [store] = host.stores().values()
+                reduced = [row for row in ledger.load(store) if row["kind"] in ("trim", "test_filter")]
+                expected = ["Grep", "Glob"] if circuit_failure else ["Bash", "Grep", "Glob"]
+                self.assertEqual([row["tool"] for row in reduced], expected,
+                                 hook_evidence(completed.stdout, Fixture.arrivals))
+                for row in reduced:
+                    self.assertEqual((row["kind"], row.get("native_text_boundary_reconciled")), ("trim", True), row)
+                    self.assertLess(row["bytes_after"], row["bytes_before"], row)
+                # One full-output snapshot per emitted trim, still written although unnamed.
+                self.assertEqual(len(list(Path(store.tool_output_dir()).glob("*.txt"))), len(expected))
             if circuit_failure:
                 sys.path.insert(0, str(ROOT / "hooks/lib"))
                 import circuit

@@ -47,10 +47,15 @@ LAUNCHERS |= {("os", name) for name in ("system", "popen", "execv", "execve", "e
                                          "execle", "execlpe", "spawnv", "spawnve", "spawnvp", "spawnvpe", "spawnl",
                                          "spawnlp", "posix_spawn", "posix_spawnp")}
 
-# (relative path, module) -> why it is not egress. Empty today: no hook or
-# script imports a network module. ``urllib.parse`` is pure string handling
-# and is not in NETWORK_MODULES, so it needs no entry.
-ALLOWED_IMPORTS = {}
+# (relative path, module) -> why it is not egress. ``urllib.parse`` is pure
+# string handling and is not in NETWORK_MODULES, so it needs no entry.
+ALLOWED_IMPORTS = {
+    ("scripts/pairing.py", "urllib.request"):
+        "loopback only: posts the person's plan, permission and approval code to the bundled runtime's own setup "
+        "and claim pages on 127.0.0.1 (the URLs must match http://127.0.0.1:<port>/... before any request), "
+        "with proxies disabled; the runtime makes the network call, as its browser page would "
+        "(tests/pairing_regressions.py)",
+}
 
 # (relative path, tool) -> why the launch is not egress. Empty today: no
 # hook or script launches curl, wget, nc or ssh. Launches with a computed
@@ -302,7 +307,11 @@ class StateFilesCarryNoContent(unittest.TestCase):
             "PostToolUse", tool_name="Bash", tool_input={"command": command, "description": self.canaries["PROMPT"]},
             tool_response={"stdout": big, "stderr": self.canaries["ERROR"], "interrupted": False, "isImage": False},
             tool_use_id="toolu_canary_bash", duration_ms=12))
-        self.assertIn("Full output:", trimmed, "the canary run must exercise the trim lever (entitled)")
+        # The "Full output:" note is dropped at the emission boundary (native_text.source_output keeps
+        # received lines only); the lever shows as a shorter stdout in updatedToolOutput.
+        self.assertIn("updatedToolOutput", trimmed, "the canary run must exercise the trim lever (entitled)")
+        self.assertLess(len(json.loads(trimmed)["hookSpecificOutput"]["updatedToolOutput"]["stdout"]), len(big))
+        self.assertNotIn("Full output:", trimmed)
         for number in (1, 2, 3):
             self.hook("loop-guard.py", self.payload("PostToolUseFailure", tool_name="Bash", tool_input={"command": command},
                                                     error="Exit code 1\n" + self.canaries["ERROR"], is_interrupt=False,

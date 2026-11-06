@@ -105,10 +105,25 @@ class FilterNote(unittest.TestCase):
                             hook_event_name="PostToolUse", session_id="b1-note", tool_use_id="call", cwd=directory)
             reply = run_hook(event, current.handle, current.EVENTS, feature=current.FEATURE, reducer=current.REDUCER)
             stdout = reply["hookSpecificOutput"]["updatedToolOutput"]["stdout"]
-            self.assertIn("900 passing-test lines omitted; every other line is shown", stdout)
+            # hook.run's emission boundary (native_text.source_output) keeps only received
+            # lines: the filter's note and the "Full output:" line never reach the model.
+            self.assertNotIn("passing-test lines omitted", stdout)
+            self.assertNotIn("Full output: ", stdout)
             self.assertNotIn("recover", stdout.lower())
-            path = stdout.rsplit("Full output: ", 1)[1].rsplit(" (", 1)[0]
-            self.assertEqual(Path(path).read_text(encoding="utf-8"), text)
+            self.assertNotIn("additionalContext", reply["hookSpecificOutput"])
+            received = set(text.split("\n"))
+            self.assertTrue(all(line in received for line in stdout.split("\n")))
+            self.assertNotIn("test_stable[", stdout)   # the 900 parameterized passes went
+            self.assertIn("301 passed, 1 skipped", stdout)
+            # The full output is still saved beside the ledger, which names the filter.
+            store = session.Store.for_scratchpad(str(scratch))
+            saved = sorted(Path(store.path, session.TOOL_OUTPUT_DIR).glob("*.txt"))
+            self.assertEqual(len(saved), 1)
+            self.assertEqual(saved[0].read_text(encoding="utf-8"), text)
+            rows = ledger.load(store)
+            self.assertEqual([r["kind"] for r in rows], ["test_filter"])
+            self.assertTrue(rows[0]["native_text_boundary_reconciled"])
+            self.assertEqual(rows[0]["bytes_after"], len(stdout.encode()))
 
 
 class Capture(StoreCase):

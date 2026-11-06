@@ -55,7 +55,7 @@ _ork_guard_records() {
   [ -n "$any" ] || return 0
   return $found
 }
-if [ "${1:-}" = "write-guard.py" ] && ! _ork_guard_records; then
+if [ "${1:-}" = "write-guard.py" ] && [ -z "${ORK_HOOK_TELEMETRY_DIR:-}" ] && ! _ork_guard_records; then
   cat >/dev/null 2>&1
   exit 0
 fi

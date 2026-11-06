@@ -234,7 +234,13 @@ class SessionPolicy(unittest.TestCase):
         self.assertEqual(Path(first.store().policy_path).read_bytes(), before)
 
     def test_concurrent_production_processes_use_one_atomic_winner(self):
+        # The status line that used to name each process's budget is gone:
+        # native_text.clean_reply drops systemMessage, so trim-session prints
+        # nothing on a plain startup. The one winner is read from the pin, and
+        # that every process ran its handler on it from the telemetry rows
+        # (hook_telemetry.Invocation, one start and one finish per run).
         payload = dict(self.payload, hook_event_name="SessionStart", source="startup")
+        candidates = (16, 20, 24, 28, 32, 36)
         def run(value):
             env = dict(os.environ, **self.env, ORK_METER_TRIM_BUDGET_BASH=str(value * 1024))
             started = time.monotonic()
@@ -243,21 +249,26 @@ class SessionPolicy(unittest.TestCase):
                                     capture_output=True, text=True, env=env, timeout=8)
             elapsed = time.monotonic() - started
             self.assertEqual(result.returncode, 0, result.stderr)
-            if not result.stdout.strip():
-                # A process past hook.EMIT_LIMIT drops its finished reply (fail-open,
-                # #140); an overloaded runner can get there. A fast silent one is a bug.
-                self.assertGreaterEqual(elapsed, hook.EMIT_LIMIT, "empty reply after %.2fs: %r" % (elapsed, result.stderr))
-                return None
-            return json.loads(result.stdout)["systemMessage"]
+            self.assertEqual(result.stdout, "", "clean_reply keeps no systemMessage: %r" % result.stdout)
+            return elapsed
         with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
-            statuses = [status for status in pool.map(run, (16, 20, 24, 28, 32, 36)) if status is not None]
-        self.assertTrue(statuses, "every process exceeded the emit limit")
-        self.assertEqual(len(set(statuses)), 1, statuses)
+            elapsed = list(pool.map(run, candidates))
         store = session.Store.for_payload(self.payload)
+        rows = [json.loads(line) for line in Path(store.path, "hook-invocations.jsonl").read_text().splitlines()]
+        finished = [row for row in rows if row["phase"] == "finished"]
+        self.assertEqual(len(finished), len(candidates), rows)
+        # A process past hook.EMIT_LIMIT drops its finished reply (fail-open,
+        # #140); an overloaded runner can get there. Any other silence is the
+        # handler running to its None reply on the shared pin, never raising.
+        reasons = sorted(row["reason"] for row in finished)
+        self.assertEqual(sorted(set(reasons) - {"handler-no-reply"}), ["emit-deadline"] if "emit-deadline" in reasons else [], finished)
+        self.assertEqual({row["decision"] for row in finished}, {"skipped"}, finished)
+        if "emit-deadline" in reasons:
+            self.assertGreaterEqual(max(elapsed), hook.EMIT_LIMIT, elapsed)
         saved = policy.read(store, self.payload["session_id"], self.env)
-        self.assertTrue(all("Bash %dK" % (int(saved["settings"]["ORK_METER_TRIM_BUDGET_BASH"]) // 1024) in status for status in statuses))
+        self.assertIn(int(saved["settings"]["ORK_METER_TRIM_BUDGET_BASH"]) // 1024, candidates)
+        self.assertEqual(features.trim_budget(self.context().env, "Bash"), int(saved["settings"]["ORK_METER_TRIM_BUDGET_BASH"]))
         self.assertEqual(list(Path(store.path).glob("*.tmp")), [])
-
 
 if __name__ == "__main__":
     unittest.main()

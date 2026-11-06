@@ -371,6 +371,13 @@ def _handle(ctx):
             if name is not None:
                 delta.forget(ctx.store(), name)
         return None
+    # Experimental strategy runs in this same native hook, before structured
+    # output pass-through. It owns exact recovery/admission when it replies.
+    if ctx.env.get("ORK_EXPERIMENT_JSON_PREFIX_V1") == "1":
+        import json_prefix_output
+        reply = json_prefix_output.handle(ctx)
+        if reply is not None:
+            return reply
     full = FullOutput(ctx)
     try:
         result = trim(ctx, full)

@@ -9,7 +9,12 @@ silent "first failure: silent"
 run_hook loop-guard.py posttoolusefailure.bash.json
 silent "second failure: silent"
 run_hook loop-guard.py posttoolusefailure.bash.json
-assert "third identical failure: systemMessage and additionalContext, no stop" '"failed 3 times" in o["systemMessage"] and o["hookSpecificOutput"]["hookEventName"] == "PostToolUseFailure" and "3 times" in o["hookSpecificOutput"]["additionalContext"] and "continue" not in o'
+# The warning is a systemMessage plus additionalContext; hook.run's emission boundary (native_text.clean_reply)
+# keeps neither, so a warning leaves stdout empty and shows as its loop_warning ledger row.
+warned() { # <name> <failures>
+  assert "$1" 'out == "" and (lambda r: r["kind"] == "loop_warning" and r["failures"] == '"$2"')(__import__("json").loads([l for l in open("'"$SCRATCH"'/ork-meter/savings.jsonl") if l.strip()][-1]))'
+}
+warned "third identical failure: warning recorded, nothing emitted, no stop" 3
 run_hook loop-guard.py posttoolusefailure.bash.json
 silent "fourth: silent (warns again at multiples of 3)"
 
@@ -26,9 +31,9 @@ silent "interrupted call: not counted"
 # Hard stop at a user-set threshold; never without it.
 reset_fixture_policy
 run_hook loop-guard.py posttoolusefailure.bash.json ORK_METER_LOOP_STOP=5
-assert "ORK_METER_LOOP_STOP=5 at the fifth failure: continue false with a reason" 'o["continue"] is False and "ORK_METER_LOOP_STOP=5" in o["stopReason"]'
+assert "ORK_METER_LOOP_STOP=5 at the fifth failure: continue false; the stopReason is not kept at emission" 'o == {"continue": False}'
 run_hook loop-guard.py posttoolusefailure.bash.json ORK_METER_LOOP_STOP=off
-assert "sixth failure, immediate stop opt-out: warning only" '"continue" not in o and "failed 6 times" in o["systemMessage"]'
+warned "sixth failure, immediate stop opt-out: warning only" 6
 run_hook loop-guard.py posttoolusefailure.bash.json ORK_METER_LOOP_GUARD=off
 silent "ORK_METER_LOOP_GUARD=off: silent"
 run_hook loop-guard.py posttoolusefailure.bash.json ORK_METER_LOOP_WARN=2 ORK_METER_LOOP_STOP=off
@@ -47,7 +52,7 @@ silent "after session start: counter reset, first failure silent"
 run_hook loop-guard.py posttoolusefailure.bash.json ORK_METER_LOOP_STOP=0
 silent "ORK_METER_LOOP_STOP=0 means unset: second failure, no stop"
 run_hook loop-guard.py posttoolusefailure.bash.json ORK_METER_LOOP_STOP=off ORK_METER_LOOP_WARN=4
-assert "stop opt-out is immediate; warn override is deferred: third failure warns without stopping" '"continue" not in o and "failed 3 times" in o["systemMessage"]'
+warned "stop opt-out is immediate; warn override is deferred: third failure warns without stopping" 3
 
 # Ledger rows: loop_warning and loop_stop, zero bytes.
 if python3 - "$SCRATCH/ork-meter/savings.jsonl" <<'EOF'
