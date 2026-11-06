@@ -15,6 +15,8 @@ from support import load, run_hook  # noqa: E402
 import entitled  # noqa: E402
 entitled.install()
 import features  # noqa: E402
+import ledger  # noqa: E402
+import session  # noqa: E402
 
 guard = load("hooks/read-guard.py")
 
@@ -55,8 +57,11 @@ class ReadGuardLines(unittest.TestCase):
         reply = self.invoke({"ORK_METER_READ_GUARD_BYTES": "12288", "ORK_METER_READ_GUARD_LINES": "150"})
         out = reply["hookSpecificOutput"]
         self.assertEqual(out["updatedInput"]["limit"], 150)
-        self.assertIn("first 150 lines (limit=150)", out["additionalContext"])
-        self.assertIn("offset=151", out["additionalContext"])
+        # The "first 150 lines (limit=150) ... offset=151" note is additionalContext, which the emission
+        # boundary drops (hooks/lib/native_text.py clean_reply); the page shows in the ledger instead.
+        self.assertNotIn("additionalContext", out)
+        store = session.Store.for_scratchpad(str(Path(self.temporary.name) / "scratch"))
+        self.assertEqual([row["kind"] for row in ledger.load(store)], ["read_guard"])
 
     def test_page_at_least_the_file_length_is_left_alone(self):
         self.assertIsNone(self.invoke({"ORK_METER_READ_GUARD_BYTES": "12288", "ORK_METER_READ_GUARD_LINES": "400"}))

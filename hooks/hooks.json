@@ -48,6 +48,16 @@
             "timeout": 5
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/py.sh\" polling-completion.py",
+            "timeout": 275
+          }
+        ],
+        "matcher": "Bash|Read|TaskStop"
       }
     ],
     "PostToolUse": [
@@ -90,6 +100,16 @@
             "timeout": 5
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/py.sh\" polling-completion.py",
+            "timeout": 5
+          }
+        ],
+        "matcher": "Bash|Read|TaskStop"
       }
     ],
     "PostToolUseFailure": [
@@ -111,6 +131,16 @@
             "timeout": 5
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/py.sh\" polling-completion.py",
+            "timeout": 5
+          }
+        ],
+        "matcher": "Bash|Read|TaskStop"
       }
     ],
     "SubagentStop": [
@@ -139,6 +169,15 @@
             "timeout": 5
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/py.sh\" polling-completion.py",
+            "timeout": 5
+          }
+        ]
       }
     ],
     "SessionEnd": [
@@ -147,6 +186,17 @@
           {
             "type": "command",
             "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/py.sh\" session-summary.py",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolBatch": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/py.sh\" polling-completion.py",
             "timeout": 5
           }
         ]

@@ -31,6 +31,12 @@ start() { # <source> [VAR=value ...]
 }
 ON=ORK_METER_CONTEXT_HYGIENE=on
 T="$tmp/transcript.jsonl"
+# The nudge is a systemMessage; hook.run's emission boundary (hooks/lib/native_text.py
+# clean_reply) keeps no systemMessage, so a nudge leaves stdout empty and shows only
+# as its context_nudge ledger row, which names the size.
+nudged() { # <name> <context tokens>
+  assert "$1" 'out == "" and __import__("json").loads([l for l in open("'"$SCRATCH"'/ork-meter/savings.jsonl") if l.strip()][-1])["kind"] == "context_nudge" and __import__("json").loads([l for l in open("'"$SCRATCH"'/ork-meter/savings.jsonl") if l.strip()][-1])["context_tokens"] == '"$2"' and "PRIVATE" not in out'
+}
 
 transcript "$T" 130000
 prompt "$T"
@@ -43,8 +49,7 @@ silent "on, below the 120000-token threshold: no nudge"
 
 transcript "$T" 130000
 prompt "$T" "$ON"
-assert "on, at 130000 tokens: one systemMessage for the person only, with the size and both options" \
-  'list(o) == ["systemMessage"] and "130,000 tokens" in o["systemMessage"] and "/clear" in o["systemMessage"] and "/compact" in o["systemMessage"] and "PRIVATE" not in out'
+nudged "on, at 130000 tokens: nudge recorded with the size; nothing reaches stdout" 130000
 
 prompt "$T" "$ON"
 silent "rate limit: the same size again gives no second nudge"
@@ -53,10 +58,10 @@ prompt "$T" "$ON"
 silent "rate limit: growth below the 60000-token step gives no nudge"
 transcript "$T" 190000
 prompt "$T" "$ON"
-assert "rate limit: growth of a full step nudges again" '"190,000 tokens" in o["systemMessage"]'
+nudged "rate limit: growth of a full step nudges again" 190000
 transcript "$T" 250000
 prompt "$T" "$ON"
-assert "third nudge" '"250,000 tokens" in o["systemMessage"]'
+nudged "third nudge" 250000
 transcript "$T" 400000
 prompt "$T" "$ON"
 silent "cap: at most three nudges per session"
@@ -99,7 +104,7 @@ SID="ctx-session-2"
 reset_fixture_policy
 transcript "$T" 130000
 prompt "$T" "$ON"
-assert "second session: nudges again" '"130,000 tokens" in o["systemMessage"]'
+nudged "second session: nudges again" 130000
 transcript "$T" 200000
 prompt "$T" ORK_METER_CONTEXT_HYGIENE=off
 silent "dismiss: ORK_METER_CONTEXT_HYGIENE=off stops nudges at once, even in a pinned session"
@@ -120,11 +125,10 @@ SID="ctx-session-api"
 reset_fixture_policy
 transcript "$T" 130000
 prompt "$T" ANTHROPIC_API_KEY=sk-ant-PRIVATE-KEY-CANARY
-assert "per-token session (API key present): nudges without ORK_METER_CONTEXT_HYGIENE" \
-  '"130,000 tokens" in o["systemMessage"] and "PRIVATE" not in out'
+nudged "per-token session (API key present): nudges without ORK_METER_CONTEXT_HYGIENE" 130000
 transcript "$T" 200000
 prompt "$T"
-assert "pinned: the default holds for the session after the signal is gone" '"200,000 tokens" in o["systemMessage"]'
+nudged "pinned: the default holds for the session after the signal is gone" 200000
 transcript "$T" 270000
 prompt "$T" ORK_METER_CONTEXT_HYGIENE=off
 silent "an explicit off still wins at once"
@@ -243,6 +247,6 @@ else
   echo "  FAIL py.sh, lever off: $status $out"; fails=$((fails + 1))
 fi
 prompt "$T" ANTHROPIC_API_KEY=x
-assert "py.sh, lever unset in a per-token session: the hook runs and nudges" '"130,000 tokens" in o["systemMessage"]'
+nudged "py.sh, lever unset in a per-token session: the hook runs and nudges" 130000
 
 exit $(( fails > 0 ))

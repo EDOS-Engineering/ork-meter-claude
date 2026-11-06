@@ -16,7 +16,7 @@ matrix's "Recording a walkthrough" says.
 | `claude --version` (desktop app: `/status` in a Code tab session, the **Claude Code** row) | `2.1.280 (Claude Code)` or later. Note the version. |
 | `python3 --version` (Windows: `python --version`) | 3.10 or later, for the trim hooks. An older one is not a failure: step 2 then shows the Python notice instead. |
 | Windows native only: `where bash` in PowerShell, or Git for Windows installed | Git's `bash.exe` (for example `C:\Program Files\Git\bin\bash.exe`), not `C:\Windows\System32\bash.exe` |
-| WSL only: run every command inside the distribution, in a folder under `~`, not a Windows drive mount (`/mnt/<drive>`) | `uname -r` mentions `microsoft-standard-WSL2` |
+| WSL only: run every command inside the distribution, in a folder under `~`, not `/mnt/c` | `uname -r` mentions `microsoft-standard-WSL2` |
 | Desktop app only: the terminal's `claude --version` | 2.1.280 or later (connect checks the `claude` on `PATH`, not the app's copy) |
 
 Start from a clean state: no `ork-meter@edos` in `claude plugin list`. To
@@ -25,13 +25,27 @@ keep your own setup untouched on the CLI, run the whole walkthrough with
 
 ## 1. Install from the marketplace
 
-In a Claude Code session (desktop app: **+** next to the prompt box, then
-**Add plugins**, and add the marketplace and plugin there):
+A delivered release installs the way customers install it. In a Claude Code
+session (desktop app: **+** next to the prompt box, then **Add plugins**, and
+add the marketplace and plugin there):
 
 ```text
-/plugin marketplace add EDOS-Engineering/ork-meter-claude
+/plugin marketplace add https://orkmeter.com/releases/claude/marketplace.json
 /plugin install ork-meter@edos
 ```
+
+A release that is published but not yet delivered (release.md, step 13) is
+tested from the GitHub Release's zip through a local marketplace, which
+copies the tree the same way:
+
+```sh
+mkdir -p /tmp/edos-walkthrough/.claude-plugin && cd /tmp/edos-walkthrough
+gh release download v<version> -R EDOS-Engineering/ork-meter-claude -p 'ork-meter-claude-plugin-*.zip' && unzip -q ork-meter-claude-plugin-*.zip
+printf '{"name":"edos","owner":{"name":"EDOS"},"plugins":[{"name":"ork-meter","source":"./ork-meter"}]}\n' > .claude-plugin/marketplace.json
+```
+
+then `/plugin marketplace add /tmp/edos-walkthrough` and `/plugin install
+ork-meter@edos`.
 
 Then, from a shell:
 

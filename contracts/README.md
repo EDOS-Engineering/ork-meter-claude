@@ -46,7 +46,7 @@ Run each checkout independently; neither needs the other checkout installed:
 
 ```text
 python -I -B contracts/check.py --adapter claude --root . --report .local/contract-claude.json
-python -I -B contracts/check.py --adapter codex --root ../ork-meter-codex --report .local/contract-codex.json
+python -I -B contracts/check.py --adapter codex --root ../codex-plugin --report .local/contract-codex.json
 ```
 
 The report includes the corpus/module hashes, every case ID and its adapter's

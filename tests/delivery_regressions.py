@@ -60,7 +60,11 @@ class DeliveryTests(unittest.TestCase):
                 with patch.object(ledger, "append", side_effect=append):
                     output = self.invoke()
                 response = json.loads(output)["hookSpecificOutput"]["updatedToolOutput"]
-                self.assertIn("Full output:", response["stdout"])
+                # The replacement is emitted (native_text.source_output keeps only received
+                # lines, so no "Full output:" note); the saved original still exists.
+                self.assertNotIn("Full output:", response["stdout"])
+                self.assertLess(len(response["stdout"]), len(self.payload["tool_response"]["stdout"]))
+                self.assertTrue(list(Path(self.store.path, session.TOOL_OUTPUT_DIR).glob("*.txt")))
                 self.assertEqual(len(ledger.load(self.store)), failure - 1)
                 gaps = self.store.accounting_gaps()
                 self.assertEqual(len(gaps), before_gaps + 1)

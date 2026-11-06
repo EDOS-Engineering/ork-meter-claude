@@ -13,9 +13,13 @@ earlier read, with the exact Read (offset and limit) that returns the rest
 if that earlier result is gone. No hook fires on /rewind, so an earlier
 prompt's result is never assumed to be in context (#129). Index updates are
 locked against parallel Read hooks (#131). Claude Code
-itself already answers an unchanged re-read (same mtime, content still in
-context) with a short "file unchanged" result; that case arrives here as
-``type: "file_unchanged"`` and is left alone and not counted.
+before 2.1.317 itself answers an unchanged re-read (same mtime, content
+still in context) with a short "file unchanged" result; that case arrives
+here as ``type: "file_unchanged"`` and is left alone and not counted.
+2.1.317 removed that stub: the re-read arrives as ``type: "text"`` with the
+content again and is handled like any other whole-file Read below (a
+re-read of a compacted view is compacted again, so it never brings the
+elided lines back or clears the Write guard's record).
 
 Changed re-reads (opt-in ``delta`` lever, ``ORK_METER_DELTA=on``): when the
 same whole-file Read was delivered in full earlier this conversation and the

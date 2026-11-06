@@ -183,6 +183,13 @@ class ByteCountGateDeliveryTests(unittest.TestCase):
     and its ledger row is byte counts with the ceil(bytes/4) estimate, never a
     tokenizer count."""
 
+    # The emission boundary (native_text.source_output) keeps only lines of the
+    # original tool_response, so the delivered trim must be a line the tool
+    # really printed: every fixture starts with the "short" line the trim keeps.
+    @staticmethod
+    def original(filler):
+        return "short\n" + filler
+
     def deliver(self, scratch, stdout, replacement="short"):
         payload = {"hook_event_name": "PostToolUse", "session_id": "no-tokenizer", "scratchpad_dir": scratch,
                    "tool_name": "Bash", "tool_response": {"stdout": stdout}}
@@ -209,19 +216,19 @@ class ByteCountGateDeliveryTests(unittest.TestCase):
         return self.without(stdout, "tiktoken", "pure_bpe")
 
     def test_without_tiktoken_pure_bpe_delivers_the_borderline_trim(self):
-        out, rows = self.without("data " * 4000, "tiktoken")
+        out, rows = self.without(self.original("data " * 4000), "tiktoken")
         self.assertEqual(json.loads(out)["hookSpecificOutput"]["updatedToolOutput"], {"stdout": "short"})
         self.assertEqual(len(rows), 1)
 
     def test_borderline_trim_without_tiktoken_replaces_nothing_and_credits_nothing(self):
         # 20,000 bytes: thousands of tokens saved by any real count, but only
-        # ceil(20,016 / 128) = 157 proven, short of the 512-token reserve.
-        out, rows = self.without_tiktoken("data " * 4000)
+        # ceil(20,022 / 128) = 157 proven, short of the 512-token reserve.
+        out, rows = self.without_tiktoken(self.original("data " * 4000))
         self.assertEqual(out, "")
         self.assertEqual(rows, [])
 
     def test_large_trim_without_tiktoken_is_delivered_with_a_byte_count_row(self):
-        stdout = "data " * 200000
+        stdout = self.original("data " * 200000)
         out, rows = self.without_tiktoken(stdout)
         self.assertEqual(json.loads(out)["hookSpecificOutput"]["updatedToolOutput"], {"stdout": "short"})
         self.assertEqual(len(rows), 1)
@@ -232,7 +239,7 @@ class ByteCountGateDeliveryTests(unittest.TestCase):
 
     @unittest.skipUnless(HAVE_TOKENIZER, "the offline token gate needs tiktoken in this interpreter")
     def test_control_with_the_tokenizer_the_ledger_row_is_identical(self):
-        stdout = "data " * 200000
+        stdout = self.original("data " * 200000)
         with tempfile.TemporaryDirectory() as d:
             out, rows = self.deliver(d, stdout)
         self.assertTrue(out)
@@ -243,7 +250,7 @@ class ByteCountGateDeliveryTests(unittest.TestCase):
     @unittest.skipUnless(HAVE_TOKENIZER, "the offline token gate needs tiktoken in this interpreter")
     def test_control_with_the_tokenizer_the_borderline_trim_is_delivered(self):
         with tempfile.TemporaryDirectory() as d:
-            out, rows = self.deliver(d, "data " * 4000)
+            out, rows = self.deliver(d, self.original("data " * 4000))
         self.assertEqual(json.loads(out)["hookSpecificOutput"]["updatedToolOutput"], {"stdout": "short"})
         self.assertEqual(len(rows), 1)
 

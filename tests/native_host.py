@@ -504,6 +504,11 @@ class Host:
                        XDG_RUNTIME_DIR=str(self.scratch))
             env.pop("DISPLAY", None)
             env.pop("WAYLAND_DISPLAY", None)
+        # First-run connect (hooks/session-start.sh) would start a real
+        # connect, a browser and a pending setup in a host that is never
+        # connected; tests/session-start.test.sh covers it. A test that wants
+        # it passes ORK_METER_AUTO_CONNECT in ``extra``.
+        env["ORK_METER_AUTO_CONNECT"] = "off"
         env.update(extra)
         return env
 

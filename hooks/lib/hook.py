@@ -117,6 +117,7 @@ class Context:
         self.session_policy_sha256 = None
         self.policy_sha256 = None
         self.reducer_health_sha256 = None
+        self.telemetry_effect = {}
 
     def remaining(self):
         """Seconds left before the deadline, never negative."""
@@ -172,18 +173,14 @@ class Context:
 
 
 def updated_tool_output(event, updated, additional_context=None):
-    """PostToolUse: replace the tool result, optionally with a note for Claude."""
+    """PostToolUse: replace the tool result without adding model-facing prose."""
     out = {"hookEventName": event, "updatedToolOutput": updated}
-    if additional_context:
-        out["additionalContext"] = additional_context
     return {"hookSpecificOutput": out}
 
 
 def updated_input(event, new_input, additional_context=None):
-    """PreToolUse: replace the tool input, optionally with a note for Claude."""
+    """PreToolUse: replace the tool input without adding model-facing prose."""
     out = {"hookEventName": event, "updatedInput": new_input}
-    if additional_context:
-        out["additionalContext"] = additional_context
     return {"hookSpecificOutput": out}
 
 
@@ -194,8 +191,8 @@ def denied(event, reason):
 
 
 def additional_context(event, text):
-    """A note for Claude alongside the event, nothing else changed."""
-    return {"hookSpecificOutput": {"hookEventName": event, "additionalContext": text}}
+    """Compatibility entry point; plugin-authored context is not emitted."""
+    return {}
 
 
 def system_message(text, stop=False):
@@ -224,7 +221,7 @@ def may_emit(ctx):
 
 
 def run(events, handler, feature=None, budget=DEFAULT_BUDGET, reducer=None, wanted=None, started=None,
-        launch_age=None, every_mode=False):
+        launch_age=None, every_mode=False, hook_name=None):
     """Run one hook: parse, guard, opt-out, call ``handler(ctx)``, print its
     reply as one JSON line. Never raises, never prints on error.
 
@@ -235,12 +232,16 @@ def run(events, handler, feature=None, budget=DEFAULT_BUDGET, reducer=None, want
     started = time.monotonic() if started is None else started
     payload = None
     kept_bases = False   # the handler ran with the delta lever on
+    telemetry = None
     try:
         env = os.environ
         payload = json.load(sys.stdin)
         if not isinstance(payload, dict) or payload.get("hook_event_name") not in events:
             return
+        from hook_telemetry import Invocation
+        telemetry = Invocation(hook_name or reducer or handler.__module__, payload, started)
         if wanted is not None and not wanted(env):
+            telemetry.row['reason'] = 'not-wanted'
             return
         ctx = Context(env, payload, payload["hook_event_name"], time.monotonic() + budget, defer_records=True,
                       started=started, launch_age=launch_age)
@@ -260,19 +261,32 @@ def run(events, handler, feature=None, budget=DEFAULT_BUDGET, reducer=None, want
             else:
                 if mode == "shadow":
                     trace.capture(ctx)
+                telemetry.row['reason'] = 'mode-'+mode
                 return
         if feature is not None and not features.enabled(env, feature):
+            telemetry.row['reason'] = 'feature-disabled-or-unentitled'
             return
         if blocked:
+            telemetry.row['reason'] = 'circuit-blocked'
             return
         try:
+            telemetry.row['reason'] = 'handler-no-reply'
             reply = handler(ctx)
+            telemetry.row['effects'] = ctx.telemetry_effect
+            from native_text import clean_reply, reconcile_records
+            reply = clean_reply(payload, reply)
+            reconcile_records(payload, reply, ctx._pending_records)
             kept_bases = features.enabled(ctx.env, "delta")
             circuit.validate_reply(ctx, reply)
-            if not token_gate.permits_reply(payload, reply) or not may_emit(ctx):
+            if not token_gate.permits_reply(payload, reply):
+                telemetry.row['reason'] = 'token-gate'
+                reply = None
+            elif not may_emit(ctx):
+                telemetry.row['reason'] = 'emit-deadline'
                 reply = None
         except Exception as exc:
-            circuit.fault(ctx, ctx.reducer_scope, "invariant" if isinstance(exc, circuit.InvariantError) else "handler", exc)
+            telemetry.row.update(decision='failed', reason='handler-exception')
+            circuit.fault(ctx, getattr(ctx, 'reducer_scope', reducer), "invariant" if isinstance(exc, circuit.InvariantError) else "handler", exc)
             return
         emitted = False
         if isinstance(reply, dict) and reply:
@@ -284,14 +298,25 @@ def run(events, handler, feature=None, budget=DEFAULT_BUDGET, reducer=None, want
             sys.stdout.write(serialized)
             sys.stdout.flush()
             emitted = True
+            telemetry.row.update(decision='applied', reason='reply-emitted', stdout_emitted=True)
+            specific = reply.get('hookSpecificOutput', {})
+            if 'updatedToolOutput' in specific:
+                from hook_telemetry import size
+                telemetry.row['bytes_after'] = size(specific['updatedToolOutput'])
+            telemetry.row['effects']['input_updated'] = 'updatedInput' in specific
+        elif ctx.telemetry_effect:
+            telemetry.row.update(decision='applied', reason='local-effect-without-reply')
         ctx.commit_records(emitted)
     except Exception:
-        pass
+        if telemetry is not None:
+            telemetry.row.update(decision='failed', reason='runtime-exception')
     finally:
         # Past the budget, the cleanup would eat into the margin before
         # hooks.json's kill; the base then stays, like a killed hook's.
         if not kept_bases and time.monotonic() - started < budget:
             _invalidate_delta_bases(reducer, payload)
+        if telemetry is not None:
+            telemetry.finish()
 
 
 # The hooks that keep delta bases (delta.KEEPERS). Checked here so the

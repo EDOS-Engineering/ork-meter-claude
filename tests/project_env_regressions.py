@@ -157,7 +157,13 @@ class ProjectSettingsOffOnly(unittest.TestCase):
         result = subprocess.run([sys.executable, "-I", "-B", str(ROOT / "hooks/lib/run.py"), str(ROOT / "hooks/trim-session.py")],
                                 input=json.dumps(payload), capture_output=True, text=True, env=env, timeout=8)
         self.assertEqual(result.returncode, 0, result.stderr)
-        message = json.loads(result.stdout)["systemMessage"]
+        # The notice is built (project_env.notice) but hook.run strips every systemMessage at the
+        # emission boundary (native_text.clean_reply): nothing reaches stdout, and the ignored
+        # opt-in is absent from the lever file the session start wrote.
+        self.assertEqual(result.stdout, "")
+        state = json.loads((self.root / "state/ork-meter/plugin-features.json").read_text())
+        self.assertNotIn("delta", state["features"])
+        message = project_env.notice((("ORK_METER_DELTA", "on", str(self.repo / ".claude" / "settings.json")),))
         self.assertIn("ignored ORK_METER_DELTA in " + str(self.repo / ".claude" / "settings.json"), message)
         self.assertIn("only turn levers off", message)
 

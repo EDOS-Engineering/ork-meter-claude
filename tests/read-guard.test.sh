@@ -22,9 +22,16 @@ with open(fewlines, "w") as f:
     f.write(("x" * 1000 + "\n") * 120)   # 120 KiB, 120 lines
 EOF
 
+# hook.run's emission boundary (hooks/lib/native_text.py clean_reply) drops additionalContext: the
+# guard's size/lines/offset note and the Python outline never reach the model; only updatedInput (the
+# limit) survives, and that the guard acted shows in the ledger. `last_kind` reads the newest savings row.
+last_kind() { # <name> <kind>
+  assert "$1" '"additionalContext" not in o["hookSpecificOutput"] and __import__("json").loads([l for l in open("'"$SCRATCH"'/ork-meter/savings.jsonl") if l.strip()][-1])["kind"] == "'"$2"'"'
+}
+
 export FILE="$big"; run_hook read-guard.py pretooluse.read.plain.json
 assert "large text file: updatedInput adds limit 300 and keeps the path" 'o["hookSpecificOutput"]["hookEventName"] == "PreToolUse" and o["hookSpecificOutput"]["updatedInput"] == {"file_path": os.environ["FILE"], "limit": 300}'
-assert "large text file: context gives size, lines, limit and offset hint" '"193 KiB and 3000 lines" in o["hookSpecificOutput"]["additionalContext"] and "first 300 lines" in o["hookSpecificOutput"]["additionalContext"] and "offset=301" in o["hookSpecificOutput"]["additionalContext"]'
+last_kind "large text file: no size/lines/offset note reaches the model (clean_reply); a read_guard row is recorded" read_guard
 assert "large text file: no permissionDecision (normal permission flow)" '"permissionDecision" not in o["hookSpecificOutput"]'
 
 # Claude Code's own saved output of a too-large tool result (<session_id>/tool-results/), Read because the
@@ -57,7 +64,8 @@ export FILE="$big"; run_hook read-guard.py pretooluse.read.plain.json ORK_METER_
 silent "ORK_METER_TRIM=off: untouched"
 reset_fixture_policy
 export FILE="$small"; run_hook read-guard.py pretooluse.read.plain.json ORK_METER_READ_GUARD_BYTES=4096
-assert "threshold configurable: 4.4 KiB file guarded at a 4 KiB threshold" 'o["hookSpecificOutput"]["updatedInput"]["limit"] == 300 and "500 lines" in o["hookSpecificOutput"]["additionalContext"]'
+assert "threshold configurable: 4.4 KiB file guarded at a 4 KiB threshold" 'o["hookSpecificOutput"]["updatedInput"]["limit"] == 300'
+last_kind "threshold configurable: no note (clean_reply); the guard shows in the ledger" read_guard
 reset_fixture_policy
 run_raw read-guard.py '{"hook_event_name":"PreToolUse","tool_name":"Read","tool_input":"nope"}'
 silent "odd tool_input: no output"
@@ -76,7 +84,9 @@ with open(sys.argv[1], "w") as f:
             f.write("def distant():\n    return 2\n")
 EOF
 export FILE="$tmp/large.py"; run_hook read-guard.py pretooluse.read.plain.json
-assert "large Python file (119 KB, over the 80,000-byte deferral ceiling): shorter exact page and distant AST symbol" 'o["hookSpecificOutput"]["updatedInput"]["limit"] == 48 and "distant" in o["hookSpecificOutput"]["additionalContext"]'
+# The outline page is the shorter limit (48); the AST outline itself was additionalContext, which clean_reply drops.
+assert "large Python file (119 KB, over the 80,000-byte deferral ceiling): shorter exact outline page" 'o["hookSpecificOutput"]["updatedInput"]["limit"] == 48'
+last_kind "large Python file: the outline is not emitted (clean_reply); a read_guard row is recorded" read_guard
 export FILE="$tmp/large.py"; run_hook read-guard.py pretooluse.read.offset.json
 silent "Python explicit range remains untouched"
 python3 - "$tmp/medium.py" <<'EOF'
@@ -89,7 +99,8 @@ with open(sys.argv[1], "w") as f:
             f.write("def later():\n    return 3\n")
 EOF
 export FILE="$tmp/medium.py"; run_hook read-guard.py pretooluse.read.plain.json
-assert "medium Python read, compaction off by default (#316): AST map activates below ordinary guard threshold" 'o["hookSpecificOutput"]["updatedInput"]["limit"] == 48 and "later" in o["hookSpecificOutput"]["additionalContext"]'
+assert "medium Python read, compaction off by default (#316): AST map activates below ordinary guard threshold (outline page limit)" 'o["hookSpecificOutput"]["updatedInput"]["limit"] == 48'
+last_kind "medium Python read: the outline is not emitted (clean_reply); a read_guard row is recorded" read_guard
 reset_fixture_policy   # a switch turned on takes effect from the next session
 export FILE="$tmp/medium.py"; run_hook read-guard.py pretooluse.read.plain.json ORK_METER_READ_COMPACT=on
 silent "medium Python read, compaction opted in: let through whole for Read compaction on its result"
@@ -113,7 +124,8 @@ EOF
 export FILE="$tmp/invalid.py"; run_hook read-guard.py pretooluse.read.plain.json
 silent "invalid medium Python source remains an exact native Read"
 
-# Ledger includes the model-visible context note, including an AST outline when present.
+# Ledger: bytes_after is the page plus the note the guard composed (ledger.read_guarded); the note is
+# dropped at emission and a PreToolUse reply has no updatedToolOutput, so reconcile_records leaves it.
 if python3 - "$SCRATCH/ork-meter/savings.jsonl" "$big" <<'EOF'
 import json, sys, hashlib
 rows = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]

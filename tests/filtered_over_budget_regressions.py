@@ -102,15 +102,21 @@ class FilteredOverBudget(Harness):
         raw, rows = self.invoke(current, text, command=command)
         self.assertTrue(raw, "the filtered output is delivered")
         stdout = json.loads(raw)["hookSpecificOutput"]["updatedToolOutput"]["stdout"]
-        self.assertTrue(stdout.startswith(filtered + "\nFull output: "))
+        # hook.run's emission boundary (native_text.source_output) keeps only received
+        # lines: the filtered text without its note, and no "Full output:" line.
+        self.assertEqual(stdout.split("\n"),
+                         [line for line in filtered.rstrip("\n").split("\n") if not line.startswith("… [Ork Meter")])
+        self.assertNotIn("Full output: ", stdout)
         for line in text.split("\n"):
             if trimmer.mandatory_line(line):
                 self.assertIn(line, stdout.split("\n"))
-        path = stdout.rsplit("Full output: ", 1)[1].rsplit(" (", 1)[0]
-        self.assertEqual(Path(path).read_text(encoding="utf-8"), text)
+        # The full output is still saved (text + sidecar), found by listing rather than a cited path.
         self.assertEqual(len(self.artifacts()), 2)
-        self.assertEqual([(r["kind"], r["bytes_before"], r["bytes_after"]) for r in rows],
-                         [("test_filter", trimmer.nbytes(text), trimmer.nbytes(stdout))])
+        saved = [p for p in self.artifacts() if p.endswith(".txt")]
+        self.assertEqual((self.scratch / "ork-meter" / session.TOOL_OUTPUT_DIR / saved[0]).read_text(encoding="utf-8"), text)
+        # The test_filter row is charged for the emitted stdout (native_text.reconcile_records).
+        self.assertEqual([(r["kind"], r["bytes_before"], r["bytes_after"], r.get("native_text_boundary_reconciled"))
+                          for r in rows], [("test_filter", trimmer.nbytes(text), trimmer.nbytes(stdout), True)])
         self.assertLess(trimmer.nbytes(stdout), trimmer.nbytes(text))
         return stdout
 

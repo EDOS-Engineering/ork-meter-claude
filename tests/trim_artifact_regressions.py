@@ -5,6 +5,14 @@ gates the reply, and only then writes the file; dedupe-reads.py does the same
 for its Read snapshot (#190). Cases run the production entry point
 (``hook.run``) unless they need to steer the clock mid-handler. The text is
 stored once, in the ``.txt``, and every layout written before still loads.
+
+The note never reaches stdout: hook.run passes the reply through
+native_text.clean_reply, whose source_output keeps only lines the tool
+produced, so the emitted stdout has no "Full output:" line and the reply no
+additionalContext. The artifact is still written for an emitted reply; a
+case that ran hook.run finds it by its name (artifacts.prepare is pure and
+names the same file the handler named), a case that called the handler
+directly still reads the note.
 """
 import hashlib
 import json
@@ -52,18 +60,39 @@ class FullOutputAfterGate(StoreCase):
 
     @staticmethod
     def cited(reply):
+        """The artifact a handler's (unemitted) reply names in its note."""
         stdout = reply["hookSpecificOutput"]["updatedToolOutput"]["stdout"]
         return Path(stdout.rsplit("Full output: ", 1)[1].rsplit(" (", 1)[0])
+
+    def artifact(self, payload):
+        """The artifact an emitted reply for ``payload`` leaves: the note that
+        named it is dropped at the emission boundary (native_text.source_output),
+        so the locator is the file's own name, which the handler derived the
+        same way (artifacts.prepare names without writing)."""
+        return Path(artifacts.prepare(self.store, "Bash", payload["tool_response"], payload["tool_response"]["stdout"]).path)
+
+    @staticmethod
+    def assert_no_note(test, reply):
+        # native_text.clean_reply: no additionalContext, and source_output keeps
+        # only received lines, so the plugin's "Full output:" note is gone.
+        test.assertNotIn("additionalContext", reply["hookSpecificOutput"])
+        test.assertNotIn("Full output:", reply["hookSpecificOutput"]["updatedToolOutput"]["stdout"])
 
     def test_emitted_reply_cites_an_artifact_holding_the_full_output(self):
         payload = self.payload(LARGE)
         reply = self.run_hook(payload)
         self.assertIsNotNone(reply)
-        path = self.cited(reply)
+        self.assert_no_note(self, reply)
+        path = self.artifact(payload)
         self.assertEqual(path.read_text(), LARGE)
         self.assertEqual(artifacts.load(self.store, path.stem)["response"], payload["tool_response"])
         self.assertEqual(self.files(), [path.stem + ".json", path.name])
-        self.assertEqual([row["kind"] for row in ledger.load(self.store)], ["trim"])
+        rows = ledger.load(self.store)
+        self.assertEqual([row["kind"] for row in rows], ["trim"])
+        # native_text.reconcile_records: the trim row is charged for the emitted text.
+        self.assertTrue(rows[0]["native_text_boundary_reconciled"])
+        emitted = reply["hookSpecificOutput"]["updatedToolOutput"]["stdout"].encode("utf-8")
+        self.assertEqual(rows[0]["bytes_after"], len(emitted))
 
     def test_reply_refused_by_the_token_gate_leaves_no_artifact(self):
         reply = self.run_hook(self.payload(SMALL), env={"ORK_METER_TRIM_BUDGET_BASH": "1024"})
@@ -126,7 +155,10 @@ class FullOutputAfterGate(StoreCase):
         self.assertEqual(ledger.load(self.store), [])
 
     def test_failed_rewrite_keeps_an_identical_artifact_an_earlier_reply_cites(self):
-        path = self.cited(self.run_hook(self.payload(LARGE)))
+        payload = self.payload(LARGE)
+        self.assertIsNotNone(self.run_hook(payload))
+        path = self.artifact(payload)   # the emitted reply no longer names it (native_text.source_output)
+        self.assertTrue(path.exists())
         before = self.files()
         with patch.object(session, "write_private", side_effect=OSError("disk full")):
             self.assertIsNone(self.run_hook(self.payload(LARGE)))
@@ -150,7 +182,13 @@ class FullOutputAfterGate(StoreCase):
     def test_handler_and_hook_run_share_one_gate_verdict(self):
         with patch.object(token_gate, "permits", wraps=token_gate.permits) as permits:
             self.assertIsNotNone(self.run_hook(self.payload(LARGE)))
-        self.assertEqual(permits.call_count, 1)
+        # Two verdicts, not one: the handler (artifacts.admit) gates its own
+        # reply, with the "Full output:" note, before writing the artifact;
+        # hook.run then gates the reply native_text.clean_reply emits, whose
+        # updatedToolOutput differs (the note is gone), so token_gate's kept
+        # verdict (keyed on the replacement text) cannot be reused. Each
+        # distinct replacement is gated exactly once.
+        self.assertEqual(permits.call_count, 2)
 
     def test_gate_verdict_is_not_reused_for_a_different_reply(self):
         payload = self.payload(LARGE)
@@ -276,7 +314,13 @@ class ReadSnapshotAfterGate(unittest.TestCase):
     def test_admitted_trim_cites_a_snapshot_holding_the_file_once(self):
         ctx = self.context()
         reply = self.dedupe.handle(ctx)
-        path = Path(reply["hookSpecificOutput"]["additionalContext"].rsplit("Full original Read snapshot: ", 1)[1])
+        # hook.updated_tool_output drops its context arg: no note names the
+        # snapshot any more (native_text: plugin prose never reaches the model).
+        self.assertNotIn("additionalContext", reply["hookSpecificOutput"])
+        self.assertLess(len(reply["hookSpecificOutput"]["updatedToolOutput"]["file"]["content"]), len(READ))
+        # The snapshot is still written for the admitted reply, under the name
+        # the handler derived (artifacts.prepare is pure, so it names the same file).
+        path = Path(artifacts.prepare(self.store, "Read", ctx.payload["tool_response"], READ).path)
         self.assertEqual(path.read_text(), READ)
         self.assertEqual(self.files(), [path.stem + ".json", path.name])
         self.assertNotIn("value_00001", path.with_suffix(".json").read_text())

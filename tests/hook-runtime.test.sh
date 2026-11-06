@@ -12,16 +12,28 @@ run_module() { # <module path> <stdin-text> [VAR=value ...]: through run.py, as 
   status=$?
 }
 
+# hook.run's emission boundary (hooks/lib/native_text.py clean_reply) keeps only
+# hookSpecificOutput/continue/suppressOutput/decision at the top level, and in
+# hookSpecificOutput only hookEventName/updatedToolOutput/updatedInput/
+# permissionDecision; updatedToolOutput keeps only lines received from the tool
+# (source_output) and must then pass token_gate. The echo handler replies with an
+# updatedInput, which survives verbatim, and carries the budget check in it.
 cat > "$mods/echo.py" <<'EOF'
+EVENTS = ("PreToolUse",)
+def handle(ctx):
+    return {"hookSpecificOutput": {"hookEventName": ctx.event, "updatedInput": {"remaining_ok": 0 < ctx.remaining() <= 1.5}}, "remaining_ok": True}
+EOF
+cat > "$mods/context.py" <<'EOF'
 EVENTS = ("PostToolUse",)
 def handle(ctx):
-    return {"hookSpecificOutput": {"hookEventName": ctx.event, "additionalContext": "hi"}, "remaining_ok": 0 < ctx.remaining() <= 1.5}
+    return {"hookSpecificOutput": {"hookEventName": ctx.event, "additionalContext": "hi"}, "systemMessage": "hello"}
 EOF
 cat > "$mods/gated.py" <<'EOF'
 EVENTS = ("PostToolUseFailure",)
 FEATURE = "loop_guard"
 def handle(ctx):
-    return {"systemMessage": "on"}
+    import hook
+    return hook.system_message("on", stop="why")
 EOF
 cat > "$mods/raises.py" <<'EOF'
 EVENTS = ("SessionEnd",)
@@ -44,20 +56,25 @@ def handle(ctx):
 EOF
 
 # run: parse, guard, opt-out, reply, fail-open.
-run_module "$mods/echo.py" '{"hook_event_name":"PostToolUse"}'
-assert "matching event: the handler's dict is printed as one JSON line" 'o == {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": "hi"}, "remaining_ok": True} and "\n" not in out'
 run_module "$mods/echo.py" '{"hook_event_name":"PreToolUse"}'
+# clean_reply drops the top-level remaining_ok; the one inside updatedInput says the budget held.
+assert "matching event: the handler's reply is printed as one JSON line, cleaned (no top-level extras)" 'o == {"hookSpecificOutput": {"hookEventName": "PreToolUse", "updatedInput": {"remaining_ok": True}}} and "\n" not in out'
+run_module "$mods/context.py" '{"hook_event_name":"PostToolUse","tool_name":"Bash","tool_response":{"stdout":"x","stderr":""},"session_id":"s","scratchpad_dir":"'"$tmp/ctx"'"}'
+silent "additionalContext and systemMessage only: clean_reply leaves nothing, so nothing is printed"
+assert "the dropped reply still leaves a telemetry row (hook_telemetry.Invocation, decision skipped)" '[r for r in map(__import__("json").loads, open("'"$tmp/ctx"'/ork-meter/hook-invocations.jsonl")) if r["hook"] == "context.py" and r["phase"] == "finished"][-1]["decision"] == "skipped"'
+run_module "$mods/echo.py" '{"hook_event_name":"PostToolUse"}'
 silent "wrong event: prints nothing"
-run_module "$mods/echo.py" '{"hook_event_name":["PostToolUse"]}'
+run_module "$mods/echo.py" '{"hook_event_name":["PreToolUse"]}'
 silent "odd hook_event_name type: prints nothing"
-run_module "$mods/echo.py" '["PostToolUse"]'
+run_module "$mods/echo.py" '["PreToolUse"]'
 silent "payload not an object: prints nothing"
 run_module "$mods/echo.py" '{not json'
 silent "malformed stdin: prints nothing, exit 0"
 run_module "$mods/echo.py" ''
 silent "empty stdin: prints nothing, exit 0"
 run_module "$mods/gated.py" '{"hook_event_name":"PostToolUseFailure"}'
-assert "feature on: reply printed" 'o == {"systemMessage": "on"}'
+# clean_reply keeps "continue" and drops systemMessage and stopReason.
+assert "feature on: reply printed as the stop alone (systemMessage/stopReason stripped by clean_reply)" 'o == {"continue": False}'
 run_module "$mods/gated.py" '{"hook_event_name":"PostToolUseFailure"}' ORK_METER_LOOP_GUARD=off
 silent "feature off (ORK_METER_LOOP_GUARD=off): prints nothing"
 run_module "$mods/gated.py" '{"hook_event_name":"PostToolUseFailure"}' ORK_METER_LOOP_GUARD=0
@@ -80,21 +97,31 @@ def same(got, want):
     assert json.dumps(got) == json.dumps(want), (json.dumps(got), json.dumps(want))
 same(hook.updated_tool_output("PostToolUse", {"stdout": "x"}),
      {"hookSpecificOutput": {"hookEventName": "PostToolUse", "updatedToolOutput": {"stdout": "x"}}})
+# The additional_context argument is ignored: plugin-authored context is not emitted (hook.py).
 same(hook.updated_tool_output("PostToolUse", {"stdout": "x"}, "note"),
-     {"hookSpecificOutput": {"hookEventName": "PostToolUse", "updatedToolOutput": {"stdout": "x"}, "additionalContext": "note"}})
+     {"hookSpecificOutput": {"hookEventName": "PostToolUse", "updatedToolOutput": {"stdout": "x"}}})
 same(hook.updated_tool_output("PostToolUse", {}, ""),
      {"hookSpecificOutput": {"hookEventName": "PostToolUse", "updatedToolOutput": {}}})
 same(hook.updated_input("PreToolUse", {"file_path": "/f", "limit": 300}, "paged"),
-     {"hookSpecificOutput": {"hookEventName": "PreToolUse", "updatedInput": {"file_path": "/f", "limit": 300}, "additionalContext": "paged"}})
+     {"hookSpecificOutput": {"hookEventName": "PreToolUse", "updatedInput": {"file_path": "/f", "limit": 300}}})
 same(hook.updated_input("PreToolUse", {"a": 1}),
      {"hookSpecificOutput": {"hookEventName": "PreToolUse", "updatedInput": {"a": 1}}})
-same(hook.additional_context("PostToolUseFailure", "again"),
-     {"hookSpecificOutput": {"hookEventName": "PostToolUseFailure", "additionalContext": "again"}})
+same(hook.additional_context("PostToolUseFailure", "again"), {})
+same(hook.denied("PreToolUse", "why"),
+     {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": "why"}})
 same(hook.system_message("hello"), {"systemMessage": "hello"})
 same(hook.system_message("hello", stop=True), {"systemMessage": "hello", "continue": False})
 same(hook.system_message("hello", stop="why"), {"systemMessage": "hello", "continue": False, "stopReason": "why"})
 same(hook.system_message(None, stop="why"), {"continue": False, "stopReason": "why"})
 same(hook.system_message(None), {})
+# What hook.run prints of them: native_text.clean_reply, applied before every emission.
+from native_text import clean_reply
+assert clean_reply({}, hook.system_message("hello")) is None
+assert clean_reply({}, hook.system_message("hello", stop="why")) == {"continue": False}
+assert clean_reply({}, hook.additional_context("PostToolUseFailure", "again")) is None
+assert clean_reply({}, hook.denied("PreToolUse", "why")) == {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny"}}
+assert clean_reply({"tool_response": {"stdout": "a\nb", "stderr": ""}}, hook.updated_tool_output("PostToolUse", {"stdout": "a\nnote", "stderr": "", "truncatedByTokenCap": True}, "n")) \
+    == {"hookSpecificOutput": {"hookEventName": "PostToolUse", "updatedToolOutput": {"stdout": "a", "stderr": ""}}}
 '
 
 # Context: store() resolves once and remembers the session; record() stamps and appends a constructed ledger row.
@@ -135,11 +162,13 @@ with patch.object(hook.time, "monotonic", side_effect=[100.0, 100.05, 101.0]):
 '
 
 # The real hooks still launch by name through py.sh, as hooks.json names them.
+# Its status line is a systemMessage, which clean_reply drops: the run shows only in the telemetry row.
 run_raw trim-session.py '{"hook_event_name":"SessionStart","source":"startup","session_id":"s","scratchpad_dir":"'"$SCRATCH"'"}'
-assert "py.sh trim-session.py: runs through the runtime" 'o["systemMessage"].startswith("Ork Meter trim: on")'
+assert "py.sh trim-session.py: runs through the runtime (status line stripped; a finished telemetry row names it)" 'out == "" and [r for r in map(__import__("json").loads, open("'"$SCRATCH"'/ork-meter/hook-invocations.jsonl")) if r["hook"] == "trim-session.py" and r["event"] == "SessionStart"][-1]["phase"] == "finished"'
 reset_fixture_policy
 run_raw loop-guard.py '{"hook_event_name":"PostToolUseFailure","tool_name":"Bash","tool_input":{"command":"x"},"session_id":"s","scratchpad_dir":"'"$SCRATCH"'"}' ORK_METER_LOOP_WARN=1 ORK_METER_LOOP_STOP=1
-assert "py.sh loop-guard.py: composed reply keeps its key order" 'list(o) == ["systemMessage", "hookSpecificOutput", "continue", "stopReason"] and o["continue"] is False'
+# Of the composed reply (systemMessage, hookSpecificOutput with additionalContext, continue, stopReason) only the stop survives clean_reply; the ledger says why.
+assert "py.sh loop-guard.py: composed reply reduced to the stop alone; the loop_stop row is recorded" 'o == {"continue": False} and __import__("json").loads([l for l in open("'"$SCRATCH"'/ork-meter/savings.jsonl") if l.strip()][-1])["kind"] == "loop_stop"'
 run_raw nope.py '{"hook_event_name":"SessionStart"}'
 silent "py.sh with an unknown script: prints nothing, exit 0"
 
@@ -155,6 +184,7 @@ import os, write_guard
 text = open(sys.argv[1]).read()
 write_guard.remember(os.environ, sys.argv[1], text, [(41, 50, "body")], write_guard.view_key({"session_id": "rt"}))' "$guarded"
 run_raw write-guard.py "$write_payload"
-assert "py.sh write-guard.py with a record: the guard runs and refuses a Write deleting unread lines" 'o["hookSpecificOutput"]["permissionDecision"] == "deny" and "41\u201350 body" in o["hookSpecificOutput"]["permissionDecisionReason"]'
+# hook.denied still carries the reason, but clean_reply keeps only permissionDecision.
+assert "py.sh write-guard.py with a record: the guard runs and refuses a Write deleting unread lines (decision only, no reason text)" 'o == {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny"}}'
 
 [ "$fails" -eq 0 ]

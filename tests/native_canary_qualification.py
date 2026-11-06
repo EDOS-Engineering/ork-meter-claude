@@ -18,7 +18,7 @@ lowercases repository names in telemetry attributes.
 * Run 1, installed and not connected (the runtime installed untimed first,
   Host.warm; the cold install is native_runtime_install_qualification's):
   no external traffic; the SessionStart
-  hook exits 0 with at most one line; full-output copies exist only in the
+  hook exits 0 and prints nothing; full-output copies exist only in the
   plugin's session store (or the plugin data / state dirs), besides Claude
   Code's own local copies (its persisted tool result in its config dir and,
   on some versions, its task output under the temp dir); nothing under
@@ -144,8 +144,10 @@ class Canaries:
 
 
 def session_start_responses(stream):
-    """The hook_response events of hooks/session-start.sh (its output names
-    an /ork-meter: command; when connected it prints nothing)."""
+    """The hook_response events of the SessionStart hooks that printed an Ork
+    Meter line. hooks/session-start.sh starts silently (the runtime's routine
+    notices are discarded); the only line it still prints is the failure
+    warning "Ork Meter: automatic capture is unavailable."."""
     found = []
     for line in stream.splitlines():
         try:
@@ -154,7 +156,7 @@ def session_start_responses(stream):
             continue
         if (isinstance(item, dict) and item.get("subtype") == "hook_response"
                 and str(item.get("hook_name", "")).startswith("SessionStart")
-                and "Ork Meter: " in str(item.get("stdout")) and "/ork-meter:" in str(item.get("stdout"))):
+                and "Ork Meter" in str(item.get("stdout"))):
             found.append(item)
     return found
 
@@ -355,9 +357,11 @@ class NativeCanary(unittest.TestCase):
             record_sink("proxy (every non-local request, runtime included)", True, ["REQUEST"] * len(host.refused))
             assert_hooks_fail_open(self, completed.stdout)
             self.assertIn("PostToolUse:Bash", hook_names(completed.stdout))
-            responses = session_start_responses(completed.stdout)
-            self.assertEqual(len(responses), 1, "hooks/session-start.sh must answer once")
-            self.assertLessEqual(len(responses[0]["stdout"].strip().splitlines()), 1)
+            # hooks/session-start.sh starts silently with the runtime installed:
+            # no "/ork-meter:connect" hint, and no failure warning either.
+            self.assertIn("SessionStart:startup", hook_names(completed.stdout))
+            self.assertEqual(session_start_responses(completed.stdout), [],
+                             "hooks/session-start.sh must start silently with the runtime installed")
             self.assertIn(canaries.values["COMPLETION"], completed.stdout, "the fixture answer reached the CLI")
             self.assertTrue(list((host.plugin_data / "runtime").glob("*/ork-meter-plugin-runtime*")),
                             "scripts/runtime.sh installed the shipped runtime")

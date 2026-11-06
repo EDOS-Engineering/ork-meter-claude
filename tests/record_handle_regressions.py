@@ -223,18 +223,47 @@ class RecordHandles(unittest.TestCase):
         self.scratchpad = scratchpad
         return captured.getvalue()
 
+    # hooks/lib/hook_telemetry.py writes a row to <scratch>/ork-meter/hook-invocations.jsonl
+    # on every run, before the opt-out, so a switched-off run still creates that one file.
+    TELEMETRY_ONLY = ['hook-invocations.jsonl']
+
+    def assertOnlyTelemetry(self, scratchpad):
+        self.assertEqual(os.listdir(scratchpad), ['ork-meter'])
+        self.assertEqual(os.listdir(os.path.join(scratchpad, 'ork-meter')), self.TELEMETRY_ONLY)
+
+    def assertDelivered(self, stdout, scratchpad):
+        """The record-handle reply as hook.run prints it now: updatedToolOutput
+        with no additionalContext (native_text.clean_reply), the artifact pair
+        on disk and a trim row in the ledger. The 'ork-record-handle-v1'
+        descriptor is not a line of the received text, so
+        native_text.source_output strips it from the emitted text; the saved
+        artifact and the ledger row are the evidence the lever ran."""
+        output = json.loads(stdout)
+        specific = output['hookSpecificOutput']
+        self.assertEqual(sorted(specific), ['hookEventName', 'updatedToolOutput'])
+        self.assertNotIn('additionalContext', specific)
+        self.assertNotIn('systemMessage', output)
+        self.assertNotIn('private-value-', stdout)
+        directory = Path(scratchpad) / 'ork-meter' / session.TOOL_OUTPUT_DIR
+        names = sorted(p.name for p in directory.iterdir())
+        self.assertEqual(len(names), 2, names)
+        self.assertEqual((directory / names[1]).read_text(encoding='utf-8'), self.raw)
+        rows = ledger.load(session.Store.for_scratchpad(scratchpad))
+        self.assertEqual([(row['kind'], row['tool']) for row in rows], [('trim', self.payload['tool_name'])])
+        return output
+
     def test_fresh_session_with_the_variable_unset_is_off(self):
         # #146: the default is off; nothing asserted it through the runtime.
         self.assertEqual(policy.snapshot({}, 'fresh')['settings']['ORK_METER_RECORD_HANDLES'], '0')
         self.assertEqual(self.run_hook({}, 'fresh-unset'), '')
-        self.assertEqual(os.listdir(self.scratchpad), [], 'and does no session-store work')
+        self.assertOnlyTelemetry(self.scratchpad)   # no session store, pin or ledger
 
     def test_switch_takes_the_same_spellings_as_other_switches(self):
         # #145: only the literal "1" used to turn it on.
         for spelling in ('1', 'on', 'true', 'yes', 'ON', ' Yes '):
             with self.subTest(spelling=spelling):
                 self.assertEqual(features.value({'ORK_METER_RECORD_HANDLES': spelling}, 'trim', 'record_handles'), 1)
-                self.assertIn('ork-record-handle-v1', self.run_hook({'ORK_METER_RECORD_HANDLES': spelling}, 'on-' + spelling))
+                self.assertDelivered(self.run_hook({'ORK_METER_RECORD_HANDLES': spelling}, 'on-' + spelling), self.scratchpad)
         for spelling in ('0', 'off', 'false', 'no', 'OFF', '', 'junk', '2'):
             with self.subTest(spelling=spelling):
                 self.assertEqual(features.value({'ORK_METER_RECORD_HANDLES': spelling}, 'trim', 'record_handles'), 0)
@@ -259,7 +288,7 @@ class RecordHandles(unittest.TestCase):
             for env in ({}, {'ORK_METER_RECORD_HANDLES': 'off'}):
                 with self.subTest(env=env):
                     self.assertEqual(self.run_hook(env, 'early'), '')
-                    self.assertEqual(os.listdir(self.scratchpad), [])
+                    self.assertOnlyTelemetry(self.scratchpad)
         for step in (bind, gate, circuit):
             step.assert_not_called()
 
@@ -337,8 +366,7 @@ class RecordHandles(unittest.TestCase):
                    str(ROOT / 'hooks/compact-records.py')]
         result = subprocess.run(command, input=json.dumps(payload), text=True, env=env,
                                 capture_output=True, timeout=10, check=True)
-        output = json.loads(result.stdout)
-        self.assertIn('ork-record-handle-v1', json.dumps(output))
+        self.assertDelivered(result.stdout, self.temporary.name)
         env['ORK_METER_RECORD_HANDLES'] = '0'
         result = subprocess.run(command, input=json.dumps(payload), text=True, env=env,
                                 capture_output=True, timeout=10, check=True)

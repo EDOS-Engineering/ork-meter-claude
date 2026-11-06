@@ -52,7 +52,7 @@ exec(open(os.environ["CONTRACT"]).read())
 path = features.write_features_file({"XDG_STATE_HOME": os.environ["XDG_STATE_HOME"]})
 assert path == os.path.join(os.environ["XDG_STATE_HOME"], "ork-meter", "plugin-features.json"), path
 doc = check(path)
-assert doc["features"] == ["audit", "cache_nudge", "dedupe", "loop_guard", "read_guard", "test_filter", "trim"], doc
+assert doc["features"] == sorted(["audit", "cache_nudge", "dedupe", "loop_guard", "read_guard", "test_filter", "trim"] ), doc
 assert oct(os.stat(path).st_mode & 0o777) == "0o600"
 assert oct(os.stat(os.path.dirname(path)).st_mode & 0o777) == "0o700"
 ' \

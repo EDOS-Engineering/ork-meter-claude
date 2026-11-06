@@ -9,10 +9,15 @@ broken in one of four ways, all through HTTP(S)_PROXY:
 * offline: HTTP(S)_PROXY names a closed localhost port;
 * 5xx: the proxy answers 502.
 
-In every mode the SessionStart hook finishes in under 3 s with exit 0 and at
-most one line, every plugin hook reports exit 0, ``/ork-meter:status``
+In every mode the SessionStart hook finishes in under 3 s with exit 0 and
+prints nothing (hooks/session-start.sh keeps only its failure warning), the
+runtime's own session start (``scripts/runtime.sh --if-installed
+session-start``, whose stdout that hook discards) still tells the person to
+run ``/ork-meter:connect``, every plugin hook reports exit 0,
+``/ork-meter:status``
 (skills/status/SKILL.md: ``scripts/runtime.sh --plugin-data … status``)
-answers not-connected or unverified within its bound, and a fixed one-turn
+answers not-connected or unverified within its bound with the runtime's own
+recovery text as its next step, and a fixed one-turn
 ``claude --print`` takes no more than MARGIN seconds longer than the same
 run with the proxy refusing instantly (the baseline). Not connected, the
 runtime has nothing to send, so these runs also show it does not try: the
@@ -40,6 +45,14 @@ from native_host import Host, assert_hooks_fail_open, bash  # noqa: E402
 MARGIN = 2.0          # seconds over the baseline one-turn run
 STATUS_BOUND = 5.0
 NOT_CONNECTED = {"not_connected", "connection_unverified"}
+# status's next_step is the runtime's own recovery text (skills/status/SKILL.md),
+# and which one depends on the isolated credential store, not on the failure
+# mode: an empty, readable store (macOS keychain of the private HOME, Windows
+# Credential Manager) reads not_connected; a Secret Service that cannot be
+# reached (Linux, D-Bus pointed at a missing socket; docs/failure-behaviour.md
+# "OS credential store locked or missing") reads connection_unverified.
+NEXT_STEPS = {"Run /ork-meter:connect.",
+              "Unlock the OS credential store and retry. Do not share credentials."}
 TIMINGS = {}
 
 
@@ -70,16 +83,27 @@ class NativeFailure(unittest.TestCase):
         self.assertIn("QUALIFIED", completed.stdout)
         return elapsed
 
+    def runtime(self, host, env, *args):
+        completed = subprocess.run([bash(env), (host.plugin / "scripts/runtime.sh").as_posix(), "--plugin-data", str(host.plugin_data)]
+                                   + list(args), cwd=host.work, env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(completed.returncode, 0, completed.stderr[-500:])
+        return completed.stdout
+
+    def session_start_notice(self, host, env):
+        """What the runtime prints at session start, read from the runtime
+        itself: hooks/session-start.sh sends its stdout to /dev/null, so the
+        hook can no longer show it (as Connected.session_start_notice in
+        tests/native_failure_connected_qualification.py)."""
+        return self.runtime(host, env, "--if-installed", "session-start").strip()
+
     def status(self, host, env):
         started = time.monotonic()
-        completed = subprocess.run([bash(env), (host.plugin / "scripts/runtime.sh").as_posix(), "--plugin-data", str(host.plugin_data),
-                                    "status"], cwd=host.work, env=env, capture_output=True, text=True, timeout=60)
+        stdout = self.runtime(host, env, "status")
         elapsed = time.monotonic() - started
-        self.assertEqual(completed.returncode, 0, completed.stderr[-500:])
-        report = json.loads(completed.stdout)
+        report = json.loads(stdout)
         self.assertIn(report.get("state"), NOT_CONNECTED, report)
         self.assertEqual(report.get("authorization"), "unverified", report)
-        self.assertTrue(report.get("next_step"), report)
+        self.assertIn(report.get("next_step"), NEXT_STEPS, report)
         self.assertLess(elapsed, STATUS_BOUND, "status took %.2f s" % elapsed)
         return elapsed, report["state"]
 
@@ -99,7 +123,11 @@ class NativeFailure(unittest.TestCase):
             else:
                 host.proxy_mode = mode
             hook_seconds, message = run_session_start(self, host, env=env, bound=SESSION_START_BOUND)
-            self.assertIn("/ork-meter:connect", message)
+            # hooks/session-start.sh starts silently (the runtime's notices are
+            # discarded); the runtime itself still says how to get connected,
+            # whatever the credential store reads (docs/failure-behaviour.md).
+            self.assertEqual(message, "", "not connected, SessionStart prints nothing")
+            self.assertIn("/ork-meter:connect", self.session_start_notice(host, env))
             measured = self.one_turn(host, env)
             status_seconds, state = self.status(host, env)
             TIMINGS[mode] = {"baseline_print": round(baseline, 2), "print": round(measured, 2),

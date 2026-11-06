@@ -35,7 +35,8 @@ prompt() { # <transcript> [VAR=value ...]
 }
 ON=ORK_METER_STALE_GUARD=on
 T="$tmp/transcript.jsonl"
-HELD='o is not None and o.get("decision") == "block" and "PRIVATE" not in out'
+# The hold's reason is dropped by hook.run's emission boundary (native_text.clean_reply keeps `decision` only).
+HELD='o == {"decision": "block"} and "PRIVATE" not in out'
 
 transcript "$T" 260000 120 1h
 prompt "$T"
@@ -52,8 +53,7 @@ silent "on, cache expired but context below 100000 tokens: no hold"
 
 transcript "$T" 260000 120 1h
 prompt "$T" "$ON"
-assert "on, 1-hour cache expired 2 hours ago at 260000 tokens: held with size, idle time and all three choices" \
-  "$HELD"' and "260,000 tokens" in o["reason"] and "2 hours" in o["reason"] and "/clear" in o["reason"] and "/compact" in o["reason"] and "submit the prompt again" in o["reason"]'
+assert "on, 1-hour cache expired 2 hours ago at 260000 tokens: held (the reason text is not emitted)" "$HELD"
 
 prompt "$T" "$ON"
 silent "resubmitted in the same idle episode: let through"
@@ -74,13 +74,13 @@ EOF
 
 transcript "$T" 300000 180 1h
 prompt "$T" "$ON"
-assert "a new idle episode (newer last reply, expired again): held again" "$HELD"' and "300,000 tokens" in o["reason"]'
+assert "a new idle episode (newer last reply, expired again): held again" "$HELD"
 
 SID="stale-session-2"
 reset_fixture_policy
 transcript "$T" 150000 10 5m
 prompt "$T" "$ON"
-assert "5-minute cache, 10 minutes idle: held" "$HELD"' and "10 minutes" in o["reason"]'
+assert "5-minute cache, 10 minutes idle: held" "$HELD"
 
 SID="stale-session-3"
 reset_fixture_policy
@@ -98,7 +98,7 @@ SID="stale-session-5"
 reset_fixture_policy
 transcript "$T" 260000 4000 1h
 prompt "$T" "$ON"
-assert "idle for days is reported in days" "$HELD"' and "2 days" in o["reason"]'
+assert "idle for days is reported in days" "$HELD"
 
 SID="stale-session-6"
 reset_fixture_policy
@@ -119,7 +119,7 @@ reset_fixture_policy
 transcript "$T" 260000 120 1h
 printf '%s\n' '{"type":"assistant","timestamp":"2099-01-01T00:00:00Z","message":{"id":"syn","model":"<synthetic>","content":[],"usage":{"input_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":0}}}' >> "$T"
 prompt "$T" "$ON"
-assert "a trailing <synthetic> row is skipped: held on the real turn" "$HELD"' and "260,000 tokens" in o["reason"]'
+assert "a trailing <synthetic> row is skipped: held on the real turn" "$HELD"
 
 # Unattended prompts are never held: nobody would resubmit them (#329 review).
 SID="stale-session-unattended"
@@ -151,20 +151,24 @@ assert "the marker only counts at the start; an interactive cli prompt is held, 
 SID="stale-session-10"
 reset_fixture_policy
 transcript "$T" 260000 120 1h
+# A nudge is a systemMessage, not kept at emission: it shows as its context_nudge ledger row only.
+nudged() { # <name> <context tokens>
+  assert "$1" 'out == "" and (lambda r: r["kind"] == "context_nudge" and r["context_tokens"] == '"$2"')(__import__("json").loads([l for l in open("'"$SCRATCH"'/ork-meter/savings.jsonl") if l.strip()][-1]))'
+}
 nudge() { run_raw context-nudge.py '{"hook_event_name":"UserPromptSubmit","session_id":"'"$SID"'","prompt":"PRIVATE_PROMPT_CANARY","transcript_path":"'"$T"'","scratchpad_dir":"'"$SCRATCH"'"}' "$@"; }
 nudge "$ON" ORK_METER_CONTEXT_HYGIENE=on
 silent "both on, cache expired: the context nudge defers to the guard"
 nudge "$ON" ORK_METER_CONTEXT_HYGIENE=on CLAUDE_CODE_ENTRYPOINT=sdk-cli
-assert "both on, non-interactive: the guard won't hold, so the context nudge speaks" '"260,000 tokens" in o["systemMessage"]'
+nudged "both on, non-interactive: the guard won't hold, so the context nudge speaks" 260000
 SID="stale-session-11"
 reset_fixture_policy
 nudge ORK_METER_CONTEXT_HYGIENE=on
-assert "guard off: the context nudge still speaks" '"260,000 tokens" in o["systemMessage"]'
+nudged "guard off: the context nudge still speaks" 260000
 SID="stale-session-12"
 reset_fixture_policy
 transcript "$T" 260000 30 1h
 nudge "$ON" ORK_METER_CONTEXT_HYGIENE=on
-assert "both on, cache still warm: the context nudge speaks" '"260,000 tokens" in o["systemMessage"]'
+nudged "both on, cache still warm: the context nudge speaks" 260000
 
 # Gates: Plus, mode and unreadable transcripts.
 SID="stale-session-7"
