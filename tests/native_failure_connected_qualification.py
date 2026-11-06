@@ -76,12 +76,24 @@ RUNTIME_CANDIDATES = {
         "linux-amd64": "d1853283ef75d62b50cb01b622f23fc70de9399c11f9c0b113378244551f395f",
         "linux-arm64": "41c4fb999bd9a7a3bb506c1bd1ff0844e7343195ed686e29427ee7b05d975d74",
     }),
+    "0.5.7": ("abf75c4782707f8e45341b012f2879741f79f008", {
+        "linux-amd64": "705a835e3e0fbff83bfa523a400d19c0a823960994a6d0e52c5fecd1ccfcef32",
+        "linux-arm64": "b08bc3a99a54ab76a72902fda6578523cafff84c92791f11aaab7b569af665ae",
+    }),
 }
+# The public sync moves plugin.json to a release version while runtime/ still
+# holds the last public release's binaries; that version's release pull request
+# replaces them. Until then the version qualifies on the runtime it was synced onto.
+SYNCED_ONTO_RUNTIME = {"0.5.7": "0.5.4"}
 # A -dev version on main ships the last release's runtime until the next release PR replaces runtime/.
 RUNTIME_CANDIDATES["0.5.4-dev"] = RUNTIME_CANDIDATES["0.5.3"]
 _PLUGIN_VERSION = json.loads((ROOT / ".claude-plugin/plugin.json").read_text())["version"]
 RUNTIME_ORK_METER_REF, PINNED_RUNTIME_SHA256 = RUNTIME_CANDIDATES.get(
     _PLUGIN_VERSION, ("unregistered", {}))
+if _PLUGIN_VERSION in SYNCED_ONTO_RUNTIME:
+    _SYNCED_ONTO = RUNTIME_CANDIDATES[SYNCED_ONTO_RUNTIME[_PLUGIN_VERSION]]
+    if runtime_sha256()[0] in _SYNCED_ONTO[1].values():
+        RUNTIME_ORK_METER_REF, PINNED_RUNTIME_SHA256 = _SYNCED_ONTO
 ORIGIN = "https://orkmeter.com"
 MARGIN = 2.0
 # Each side of the exit bound is the best of this many one-turn sessions, so
