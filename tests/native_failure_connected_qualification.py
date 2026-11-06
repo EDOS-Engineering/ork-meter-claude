@@ -174,6 +174,15 @@ class Connected:
                                    text=True, timeout=timeout)
         return completed
 
+    def session_start_notice(self):
+        """What the shipped runtime prints at session start (its once-only
+        expiry notices), read from the runtime itself: hooks/session-start.sh
+        sends the runtime's stdout to /dev/null and keeps only its own failure
+        warning, so the hook's stdout can no longer show it."""
+        completed = self.runtime("--if-installed", "session-start")
+        self.test.assertEqual(completed.returncode, 0, completed.stderr[-500:])
+        return completed.stdout.strip()
+
     def status(self):
         started = time.monotonic()
         completed = self.runtime("status")
@@ -489,9 +498,11 @@ class NativeConnectedFailure(ConnectedBase):
 
     def test_expiring_then_expired(self):
         """ork-meter #358 (#353, #354): an expiring grant is named in status
-        and once at session start; once expired, status says so without asking
-        Ork Meter, and session start says so once more. The fake keeps the
-        grant (renew="keep": an account whose access ends then).
+        and once by the runtime at session start; once expired, status says so
+        without asking Ork Meter, and the runtime's session start says so once
+        more. The hook that runs it (hooks/session-start.sh) prints nothing
+        either way. The fake keeps the grant (renew="keep": an account whose
+        access ends then).
 
         Everything that needs the platform (status, the expiring notice) runs
         first, right after pairing; the baseline needs only the local
@@ -503,9 +514,13 @@ class NativeConnectedFailure(ConnectedBase):
             self.assertEqual(report.get("authorization_expiry"), "authorization_expiring", report)
             self.assertTrue(report.get("authorization_expires_at"), report)
             self.assertIn("expires on", report["next_step"], report)
+            # The notice is the runtime's stdout, which the hook discards: the
+            # runtime is asked directly, twice, then the hook once (silent).
             notices = []
             for _ in range(2):
-                notices.append(run_session_start(self, connected.host, env=connected.env(), bound=SESSION_START_BOUND)[1])
+                notices.append(connected.session_start_notice())
+            self.assertEqual(run_session_start(self, connected.host, env=connected.env(), bound=SESSION_START_BOUND)[1], "",
+                             "expiring, the SessionStart hook prints nothing")
             baseline = connected.baseline(upload=False)
             grant = connected.platform.grants[connected.reference]
             # A baseline session's own SessionStart would otherwise take the
@@ -513,9 +528,11 @@ class NativeConnectedFailure(ConnectedBase):
             self.assertLess(fake_platform.now(), grant["expires"], "precondition: the baseline ran inside the grant")
             self.assertTrue(wait_for(lambda: fake_platform.now() >= grant["expires"], timeout=grant_seconds + 30))
             for _ in range(2):
-                notices.append(run_session_start(self, connected.host, env=connected.env(), bound=SESSION_START_BOUND)[1])
+                notices.append(connected.session_start_notice())
+            self.assertEqual(run_session_start(self, connected.host, env=connected.env(), bound=SESSION_START_BOUND)[1], "",
+                             "expired, the SessionStart hook prints nothing")
             self.assertEqual(["expires on" in notice for notice in notices], [True, False, False, False],
-                             "session start names the coming expiry exactly once: %r" % notices)
+                             "the runtime's session start names the coming expiry exactly once: %r" % notices)
             self.assertEqual(["expired on" in notice for notice in notices], [False, False, True, False],
                              "and the expiry exactly once: %r" % notices)
             mark = len(connected.platform.requests)
