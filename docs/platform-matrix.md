@@ -81,23 +81,25 @@ request. `native-host` runs the installed-host suite
 (`.github/scripts/check-native-host.py`: manifests validated with
 `--strict`, then the plugin loaded into the installed `claude` against a
 localhost inference fixture, with no skipped cases); `unit` runs
-`tests/run.sh` without Claude Code. On pull requests `native-host` skips
-macOS with 2.1.280 to save macOS minutes; merge groups and nightly runs keep
-it, so every listed CI row passes before a change reaches `main`. A merge
-group whose tree equals its up-to-date PR's head reuses that PR's passing run
-for the other rows and runs only this one (CONTRIBUTING, "CI").
+`tests/run.sh` without Claude Code. Pull requests and merge groups run
+`native-host` on Linux and with latest on Windows, and leave out `wsl`; the
+macOS, Windows 2.1.280 and WSL rows run on the nightly and on dispatched runs,
+so they can first go red after a change reaches `main`. A
+change no installed host can see (CONTRIBUTING, "CI") runs `native-host` on
+Linux only. A merge group whose tree equals its up-to-date PR's head reuses
+that PR's passing run and runs none of them.
 
 | Platform | Surface | Claude Code | How it is verified |
 |---|---|---|---|
-| macOS arm64 | CLI | 2.1.280 | CI: `native-host (macos-latest, claude 2.1.280)` (merge group and nightly), `unit (macos-latest)` |
-| macOS arm64 | CLI | latest | CI: `native-host (macos-latest, claude latest)`, `unit (macos-latest)`. Manual: connect through hosted receipt on 2.1.296/2.1.300, 2026-10-14; marketplace install on 2.1.296, 2026-10-11 |
+| macOS arm64 | CLI | 2.1.280 | CI: `native-host (macos-latest, claude 2.1.280)` (nightly), `unit (macos-latest)` |
+| macOS arm64 | CLI | latest | CI: `native-host (macos-latest, claude latest)` (nightly), `unit (macos-latest)`. Manual: connect through hosted receipt on 2.1.296/2.1.300, 2026-10-14; marketplace install on 2.1.296, 2026-10-11 |
 | macOS x64 (Intel) | CLI | 2.1.280, latest | **Not verified.** `macos-latest` is arm64. The `darwin-amd64` runtime is built and attested but has never run. Manual walkthrough row |
 | Linux x64 | CLI | 2.1.280 | CI: `native-host (ubuntu-latest, claude 2.1.280)`, `unit (ubuntu-latest)` |
 | Linux x64 | CLI | latest | CI: `native-host (ubuntu-latest, claude latest)`, `unit (ubuntu-latest)`, `connected failure modes (linux)` (fake Ork Meter, gnome-keyring) |
 | Linux arm64 | CLI | 2.1.280, latest | CI: `unit (ubuntu-24.04-arm)` (no Claude Code). Manual: Debian 12 container, 2.1.296, local marketplace, hook fired, 2026-10-11. The installed-host suite and connect are not verified on arm64 |
-| Windows x64, native (Git Bash) | CLI | 2.1.280 | CI: `native-host (windows-latest, claude 2.1.280)`, `unit (windows-latest)` |
+| Windows x64, native (Git Bash) | CLI | 2.1.280 | CI: `native-host (windows-latest, claude 2.1.280)` (nightly), `unit (windows-latest)` |
 | Windows x64, native (Git Bash) | CLI | latest | CI: `native-host (windows-latest, claude latest)`, `unit (windows-latest)`. Manual: isolated settings and header test on 2.1.296 (README "Status") |
-| Windows x64, WSL2 Ubuntu 24.04 | CLI | latest | CI: `wsl (ubuntu-24.04, claude latest)`: `tests/run.sh`, manifest validation and the installed-host suite inside the distribution. Connect (browser, keyring) is a manual walkthrough row |
+| Windows x64, WSL2 Ubuntu 24.04 | CLI | latest | CI: `wsl (ubuntu-24.04, claude latest)` (nightly): `tests/run.sh`, manifest validation and the installed-host suite inside the distribution. Connect (browser, keyring) is a manual walkthrough row |
 | Windows x64, WSL2 Ubuntu 24.04 | CLI | 2.1.280 | **Not verified** in WSL; the same Linux build passes `native-host (ubuntu-latest, claude 2.1.280)` |
 | Windows arm64 | CLI | any | **Not verified.** There is no `windows-arm64` runtime; the x64 one would run under emulation |
 | macOS | Desktop app, Code tab | the app's own copy | **Manual walkthrough only; not yet walked** |
@@ -176,8 +178,11 @@ marketplace on Linux or Windows, and production (`orkmeter.com`).
 Before the human who delivers a release to orkmeter.com
 ([release.md](release.md), "Cutting a release", step 14) delivers it:
 
-1. Confirm the last nightly `ci` run on `main` passed every row above (it
-   runs every `native-host` leg, `wsl` and `unit (ubuntu-24.04-arm)`).
+1. Confirm a nightly or dispatched `ci` run on the release commit passed every
+   row above (it runs every `native-host` leg, `wsl` and
+   `unit (ubuntu-24.04-arm)`). If the last nightly predates the release commit,
+   dispatch `ci` on `main`: it is the only run that covers `native-host` on
+   macOS, 2.1.280 on Windows, and WSL, for that commit.
 2. Walk [platform-walkthrough.md](platform-walkthrough.md) on each manual row
    (macOS x64, Linux arm64, WSL2 connect, desktop Code tab on macOS and
    Windows) with the release tag installed from the GitHub marketplace, and

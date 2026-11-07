@@ -296,6 +296,45 @@ def fs_path(path):
     return "\\\\?\\" + value
 
 
+def open_append(path, flags=0):
+    """A write descriptor for a line log that several hooks append to at once.
+
+    One ``os.write`` on it lands whole at the end of the file. POSIX gives
+    that with ``O_APPEND``. The Windows C runtime does not: its ``O_APPEND``
+    seeks to the end and then writes, so two appenders can land on one offset
+    and overwrite each other. A handle with ``FILE_APPEND_DATA`` and no
+    ``FILE_WRITE_DATA`` makes the OS itself write at the end of the file, with
+    no lock to wait on and no row to drop. The descriptor must not carry the
+    runtime's own append flag or text mode: a seek before each write is what
+    this avoids, and text mode splits a long row into several writes.
+
+    ``flags`` are extra POSIX open flags. Raises ``OSError`` when the file
+    can't be opened; ctypes loads only on Windows, and only here.
+    """
+    path = fs_path(path)
+    if os.name != "nt":
+        return os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | flags, 0o600)
+    import ctypes
+    import msvcrt
+    file_append_data, file_read_attributes, synchronize = 0x4, 0x80, 0x100000  # fstat needs read-attributes
+    file_share_read_write, open_always, file_attribute_normal = 0x3, 4, 0x80   # what os.open's sharing allows
+    api = ctypes.WinDLL("kernel32", use_last_error=True)
+    create = api.CreateFileW
+    create.restype = ctypes.c_void_p
+    create.argtypes = (ctypes.c_wchar_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_void_p,
+                       ctypes.c_ulong, ctypes.c_ulong, ctypes.c_void_p)
+    handle = create(path, file_append_data | file_read_attributes | synchronize, file_share_read_write, None,
+                    open_always, file_attribute_normal, None)
+    if handle is None or handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        return msvcrt.open_osfhandle(handle, os.O_BINARY)
+    except BaseException:
+        api.CloseHandle.argtypes = (ctypes.c_void_p,)
+        api.CloseHandle(handle)
+        raise
+
+
 def display_path(path):
     """Keep internal Windows namespace spelling out of recovery interfaces."""
     if os.name == "nt" and path.startswith("\\\\?\\UNC\\"):

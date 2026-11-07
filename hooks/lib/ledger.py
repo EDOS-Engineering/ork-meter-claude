@@ -241,7 +241,7 @@ def stamp(row, session_id, tool_use_id=None):
 
 def append(store, row):
     """Append one JSON line to the store's ledger (file mode 0600)."""
-    fd = os.open(session.fs_path(store.ledger_path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    fd = session.open_append(store.ledger_path)
     with os.fdopen(fd, "a", encoding="utf-8") as fh:
         fh.write(json.dumps(row, sort_keys=True) + "\n")
 
