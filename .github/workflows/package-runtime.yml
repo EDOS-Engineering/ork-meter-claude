@@ -1,4 +1,5 @@
 name: package-runtime
+run-name: package-runtime ${{ inputs.plugin_version }}
 
 # Builds the plugin's Go runtime from EDOS-Engineering/ork-meter for every
 # supported platform and opens a release pull request against `main`: one

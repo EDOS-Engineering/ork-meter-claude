@@ -1,8 +1,9 @@
 name: public-sync
+run-name: public-sync ${{ inputs.version }}
 
 # Proposes a released version of the private development repository,
-# EDOS-Engineering/claude-plugin, as a pull request here. It runs only by hand,
-# after the private release is tagged and published. It checks out the private
+# EDOS-Engineering/claude-plugin, as a pull request here.
+# follow-private-release starts it after the private release is published. It checks out the private
 # repository at its signed tag v<version> with the read-only
 # ORK_METER_READ_TOKEN, verifies the tag with this repository's tag check and
 # allowed signers (from main), runs that tag's scripts/sync_public.py against
@@ -75,6 +76,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 -I -B private/scripts/sync_public.py --public public --report "$RUNNER_TEMP/sync.json"
+          python3 -I -B public/.github/scripts/prepare_sync.py --private private --public public --version "$VERSION"
           if [ -z "$(git -C public status --porcelain --untracked-files=all)" ]; then
             echo "::notice::main already matches v$VERSION; nothing to propose"
             echo "NOTHING_TO_SYNC=1" >> "$GITHUB_ENV"

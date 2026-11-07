@@ -90,26 +90,37 @@ second install channel: the marketplace install above is what customers use.
 ## Syncing from development
 
 Development happens in the private repository EDOS-Engineering/claude-plugin.
-Each version reaches this repository as a pull request before it is released
-here:
+Every private release from 0.5.8 forward becomes a release here through CI.
+**follow-private-release** (`.github/workflows/follow-private-release.yml`) runs
+every 15 minutes, reads the newest private release with `ORK_METER_READ_TOKEN`
+and advances one step (`.github/scripts/follow_release.py`):
 
-1. The private release is cut and its tag `v<version>` is signed there.
-2. A human dispatches this repository's **public-sync** workflow
-   (`.github/workflows/public-sync.yml`) with `version`. It checks out the
-   private repository at `v<version>` with `ORK_METER_READ_TOKEN` (read-only,
-   `persist-credentials: false`), verifies the tag with main's
-   `check-tag-signature.py` and `allowed_signers`, and runs that tag's
-   `scripts/sync_public.py`. The private manifest decides which paths are
-   mirrored, which this repository owns (LICENSE, README, SECURITY,
-   CONTRIBUTING, notices, the ruleset, this file, the release workflows,
-   `runtime/` and the marketplace pin are never touched) and which must never
-   leave the private repository; any leak pattern refuses the whole run before
-   a write. It then validates the plugin, runs `tests/run.sh`, pushes
-   `sync/<version>` and opens **sync: &lt;version&gt; from &lt;private sha&gt;**
-   with the workflow's own `GITHUB_TOKEN`. It never pushes to `main`, never
-   tags and never publishes. If `main` already matches, it stops with a notice.
-3. A human reviews and merges the sync pull request.
-4. The release below is cut from the merged `main`.
+1. It dispatches **public-sync** with `version`. That checks out the private
+   repository at `v<version>` (read-only, `persist-credentials: false`), verifies
+   the tag with main's `check-tag-signature.py` and `allowed_signers`, and runs
+   that tag's `scripts/sync_public.py`. The private manifest decides which paths
+   are mirrored, which this repository owns (LICENSE, README, SECURITY,
+   CONTRIBUTING, notices, the ruleset, this file, the release workflows, `runtime/`
+   and the marketplace pin are never touched) and which must never leave the
+   private repository; any leak pattern refuses the whole run before a write.
+   `prepare_sync.py` then sets `plugin.json` to `<version>-dev` and adds the
+   version's runtime pins. The run validates the plugin, runs `tests/run.sh`,
+   pushes `sync/<version>` and opens **sync: &lt;version&gt; from &lt;private
+   sha&gt;**. It never pushes to `main`, never tags and never publishes.
+2. It starts CI on the pull request if none started, and queues it when
+   `ci-gate` is green.
+3. It dispatches **package-runtime** with the private release's runtime ref. This
+   waits for `production` approval.
+4. It starts CI on the release pull request and queues it the same way.
+5. It opens an issue asking a person to sign the tag `v<version>` on the merged
+   release commit, and stops until the tag exists.
+6. It dispatches **publish-release**. This waits for `production` approval.
+7. It starts CI on the marketplace pull request and queues it the same way.
+
+A step that fails is not started again. The run opens one issue titled
+`Release follow: ...` and waits; once the cause is fixed, re-run the failed
+workflow. The next run that gets past that state closes the issue. To run a step
+by hand, dispatch its workflow; the follower picks up from whatever it finds.
 
 ## Cutting a release
 
@@ -211,18 +222,12 @@ What the workflow does, in order:
     downloadable assets (next section), then opens the pull request
     `release: point the marketplace at v<version>` from the branch
     `release-channel/v<version>`.
-12. **A human** records the release's canary evidence ("Per-release canary
-    record" below) and attaches it to the GitHub Release.
-13. **A human** installs the tag on each platform ("What this process does
-    not cover"): re-runs the manual walkthroughs of the
-    [platform matrix](platform-matrix.md) ([platform-walkthrough.md](platform-walkthrough.md);
-    its "Release checklist" lists them) and records each one, then merges
-    that pull request. **This is when customers get
-    the release.** It is a controlled path (release configuration), so an
-    agent never merges it.
+12. **follow-private-release** starts CI on that pull request and queues it
+    when `ci-gate` is green (Jeremy's decision, 2026-11-06). **This is when
+    customers of this marketplace get the release.** Canary evidence and the
+    platform walkthroughs ([platform-matrix.md](platform-matrix.md)) are not a
+    precondition; run them when a release calls for them.
 
-The commit's trailers are `Dispatched-By: <GitHub user who dispatched>`,
-`Agent: package-runtime`, `Agent-Version: github-actions` and `Model: none`;
 `Dispatched-By` records the accountable human.
 
 GitHub does not start workflows for a pull request that a workflow opened

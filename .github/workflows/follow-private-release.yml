@@ -1,0 +1,41 @@
+name: follow-private-release
+
+# Starts the public release of every new private release: the private
+# repository holds only a read token, so this repository follows it. Each run
+# advances one step (.github/scripts/follow_release.py): public-sync, then
+# package-runtime, then publish-release, starting CI on and queueing the pull
+# requests they open. The production environment still gates each build and
+# publication, and a person still signs the tag. See docs/release.md, "Syncing
+# from development".
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: follow-private-release
+  cancel-in-progress: false
+
+jobs:
+  follow:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: write # start the release workflows and CI on generated branches
+      contents: write # queue a generated pull request
+      issues: write # report a release that stopped
+      pull-requests: write # queue a generated pull request
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Advance the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRIVATE_TOKEN: ${{ secrets.ORK_METER_READ_TOKEN }} # read-only; see docs/release.md
+        run: python3 -I -B .github/scripts/follow_release.py
