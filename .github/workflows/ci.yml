@@ -36,9 +36,7 @@ jobs:
   # plugin is false only if every changed file is a root *.md or LICENSE;
   # unit, native-host, wsl and connected-failure then skip.
   # An unknown base or another event (schedule, workflow_dispatch) runs
-  # everything. host is false only if nothing changed that an installed host
-  # loads or the host suite reads (ci_paths.host_irrelevant); the Windows
-  # native-host leg then skips, and Linux's still run.
+  # everything.
   #
   # nightly is true on scheduled and dispatched runs, the only ones that run
   # the legs which have never found anything their cheaper twin did not: the
@@ -60,7 +58,6 @@ jobs:
       pull-requests: read # the PR's head and commit count
     outputs:
       plugin: ${{ steps.paths.outputs.plugin }}
-      host: ${{ steps.paths.outputs.host }}
       nightly: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
       reuse: ${{ steps.reuse.outputs.reuse }}
       reused-run: ${{ steps.reuse.outputs.run }}
@@ -163,8 +160,6 @@ jobs:
           - os: ${{ needs.changes.outputs.nightly == 'true' && 'none' || 'macos-latest' }}
           - os: ${{ needs.changes.outputs.nightly == 'true' && 'none' || 'windows-latest' }}
             claude: "2.1.280"
-          # Nothing an installed host loads changed: Linux is enough.
-          - os: ${{ needs.changes.outputs.host == 'false' && 'windows-latest' || 'none' }}
     defaults:
       run:
         shell: bash

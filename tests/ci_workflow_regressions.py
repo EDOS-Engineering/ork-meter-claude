@@ -46,15 +46,16 @@ def jobs(text):
     return {name: block(section, name, 2) for name in keys(section, 2)}
 
 
-def evaluate(expression, event, reuse=""):
+def evaluate(expression, event, host="true"):
     """The one expression shape the native-host excludes use:
-    ``<variable> == '<v>' && '<a>' || '<b>'``, where the variable is
-    github.event_name or the changes job's reuse output (#289)."""
-    match = re.fullmatch(r"\$\{\{ (github\.event_name|needs\.changes\.outputs\.reuse) == '(\w+)' "
+    ``<output> == '<v>' && '<a>' || '<b>'``, where the output is the changes
+    job's nightly (true on scheduled and dispatched runs) or host."""
+    match = re.fullmatch(r"\$\{\{ needs\.changes\.outputs\.(nightly|host) == '(\w+)' "
                          r"&& '([\w.-]+)' \|\| '([\w.-]+)' \}\}", expression)
     if not match:
         raise AssertionError("unexpected exclude expression: " + expression)
-    value = event if match.group(1) == "github.event_name" else reuse
+    nightly = "true" if event in ("schedule", "workflow_dispatch") else "false"
+    value = nightly if match.group(1) == "nightly" else host
     return match.group(3) if value == match.group(2) else match.group(4)
 
 
@@ -65,8 +66,8 @@ def flow_list(text, key):
     return [item.strip().strip('"') for item in match.group(1).split(",")]
 
 
-def native_host_legs(event, reuse=""):
-    """The native-host legs for ``event``; ``reuse`` is the changes job's output."""
+def native_host_legs(event, host="true"):
+    """The native-host legs for ``event``; ``host`` is the changes job's output."""
     matrix = block(jobs(read("ci.yml"))["native-host"], "matrix", 6)
     legs = set(itertools.product(flow_list(matrix, "os"), flow_list(matrix, "claude")))
     exclude = block(matrix, "exclude", 8)
@@ -75,7 +76,7 @@ def native_host_legs(event, reuse=""):
         raise AssertionError("unexpected exclude entry in:\n" + exclude)
     for os_expr, claude in entries:
         os_expr = os_expr.strip()
-        os_name = evaluate(os_expr, event, reuse) if os_expr.startswith("${{") else os_expr
+        os_name = evaluate(os_expr, event, host) if os_expr.startswith("${{") else os_expr
         # An entry without claude is a partial match: it excludes every claude.
         legs -= {leg for leg in legs if leg[0] == os_name and claude in ("", leg[1])}
     return legs
@@ -104,22 +105,30 @@ class CiWorkflows(unittest.TestCase):
         self.assertIn('[ "$result" = "success" ] || exit 1', gate)
 
 
-    def test_native_host_covers_every_combination_before_merge(self):
+    def test_native_host_legs_by_event(self):
+        """Nightly and dispatched runs qualify every combination; pull requests
+        and merge groups run Linux and latest on Windows, and macOS only in unit."""
         full = {(os_name, claude) for os_name in ("ubuntu-latest", "macos-latest", "windows-latest")
                 for claude in ("2.1.280", "latest")}
-        for event in ("merge_group", "schedule", "workflow_dispatch"):
+        for event in ("schedule", "workflow_dispatch"):
             with self.subTest(event=event):
                 self.assertEqual(native_host_legs(event), full)
-        self.assertEqual(native_host_legs("pull_request"), full - {("macos-latest", "2.1.280")})
+        for event in ("pull_request", "merge_group"):
+            with self.subTest(event=event):
+                self.assertEqual(native_host_legs(event), {("ubuntu-latest", "2.1.280"), ("ubuntu-latest", "latest"),
+                                                           ("windows-latest", "latest")})
 
-    def test_reuse_runs_only_the_native_host_leg_pull_requests_skip(self):
-        """#289: a merge group reusing its PR's run still qualifies every
-        combination before merge; the PR run passed all legs but this one."""
-        self.assertEqual(native_host_legs("merge_group", "true"),
-                         native_host_legs("merge_group") - native_host_legs("pull_request"))
-        self.assertEqual(native_host_legs("merge_group", "true"), {("macos-latest", "2.1.280")})
-        for reuse in ("", "false"):
-            self.assertEqual(native_host_legs("merge_group", reuse), native_host_legs("merge_group"))
+    def test_expensive_legs_are_never_dropped_outright(self):
+        """Every leg still has a run: unit (windows-latest) on every plugin
+        change, unit (macos-latest) too, and wsl, the minimum on Windows and
+        native-host on macOS nightly."""
+        ci = jobs(read("ci.yml"))
+        self.assertIn("windows-latest", flow_list(block(ci["unit"], "matrix", 6), "os"))
+        self.assertIn("macos-latest", flow_list(block(ci["unit"], "matrix", 6), "os"))
+        self.assertIn("needs.changes.outputs.nightly == 'true'", ci["wsl"])
+        self.assertNotIn("outputs.nightly", ci["unit"] + ci["connected-failure"] + ci["runtime-provenance"] + ci["release-channel"])
+        self.assertIn("nightly: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}",
+                      ci["changes"])
 
     def test_unit_runs_once_per_os(self):
         matrix = block(jobs(read("ci.yml"))["unit"], "matrix", 6)
@@ -134,7 +143,7 @@ class CiWorkflows(unittest.TestCase):
         matrix = (ROOT / "docs/platform-matrix.md").read_text(encoding="utf-8")
         ci = jobs(read("ci.yml"))
         names = {"unit (%s)" % os_name for os_name in flow_list(block(ci["unit"], "matrix", 6), "os")}
-        names |= {"native-host (%s, claude %s)" % leg for leg in native_host_legs("merge_group")}
+        names |= {"native-host (%s, claude %s)" % leg for leg in native_host_legs("schedule")}
         names.add(re.search(r"^    name: (.+)$", ci["wsl"], re.M).group(1))
         names.add(re.search(r"^    name: (.+)$", ci["connected-failure"], re.M).group(1))
         for name in sorted(names):
