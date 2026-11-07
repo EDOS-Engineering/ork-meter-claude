@@ -1,4 +1,5 @@
 name: publish-release
+run-name: publish-release ${{ inputs.plugin_version }}
 
 # Publishes the GitHub Release for a plugin version that is already merged to
 # `main` and tagged v<version> by a human (docs/release.md, "Cutting a
@@ -18,8 +19,8 @@ name: publish-release
 # tag, turns the Release back into a draft and fails, but that tag stays until
 # a human removes it (docs/release.md, "Signed release tags"). Afterwards the
 # point-marketplace job opens the pull request that moves the marketplace to
-# the new tag, which is what makes the release installable; a human merges it
-# (docs/release.md, "Release channel"). That job never pushes to main and
+# the new tag, which is what makes the release installable; follow-private-release
+# queues it (docs/release.md, "Release channel"). That job never pushes to main and
 # never pushes a tag. Manual dispatch only, from `main`, behind the protected
 # `production` environment: publication is a reviewed release operation
 # (CONTRIBUTING, condition 3). See docs/release.md, "Publishing the GitHub
