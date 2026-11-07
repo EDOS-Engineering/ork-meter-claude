@@ -85,6 +85,8 @@ RUNTIME_CANDIDATES = {
 # holds the last public release's binaries; that version's release pull request
 # replaces them. Until then the version qualifies on the runtime it was synced onto.
 SYNCED_ONTO_RUNTIME = {"0.5.7": "0.5.4"}
+# 0.5.8 is the same runtime as 0.5.7, built from the same ork-meter commit.
+RUNTIME_CANDIDATES["0.5.8-dev"] = RUNTIME_CANDIDATES["0.5.8"] = RUNTIME_CANDIDATES["0.5.7"]
 # A -dev version on main ships the last release's runtime until the next release PR replaces runtime/.
 RUNTIME_CANDIDATES["0.5.4-dev"] = RUNTIME_CANDIDATES["0.5.3"]
 _PLUGIN_VERSION = json.loads((ROOT / ".claude-plugin/plugin.json").read_text())["version"]

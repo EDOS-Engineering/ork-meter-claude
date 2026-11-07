@@ -36,15 +36,20 @@ jobs:
   # plugin is false only if every changed file is a root *.md or LICENSE;
   # unit, native-host, wsl and connected-failure then skip.
   # An unknown base or another event (schedule, workflow_dispatch) runs
-  # everything.
+  # everything. host is false only if nothing changed that an installed host
+  # loads or the host suite reads (ci_paths.host_irrelevant); the Windows
+  # native-host leg then skips, and Linux's still run.
+  #
+  # nightly is true on scheduled and dispatched runs, the only ones that run
+  # the legs which have never found anything their cheaper twin did not: the
+  # minimum Claude Code on Windows, every native-host leg on macOS, and wsl.
   #
   # On merge_group only, reuse (#289, .github/scripts/ci_reuse.py) is true
   # when the merge group's tree equals its one PR's up-to-date head, whose
   # pull_request run of this workflow passed with every job run: the same
-  # tree, so the same ci.yml, scripts and tests. unit, wsl and
-  # connected-failure then skip and native-host runs only the leg pull
-  # requests leave out. Any doubt, an API error, or a failure of the step
-  # itself leaves reuse unset: a full run. Other events never reuse.
+  # tree, so the same ci.yml, scripts and tests. unit, native-host, wsl and
+  # connected-failure then skip. Any doubt, an API error, or a failure of the
+  # step itself leaves reuse unset: a full run. Other events never reuse.
   changes:
     name: changes
     runs-on: ubuntu-latest
@@ -55,6 +60,8 @@ jobs:
       pull-requests: read # the PR's head and commit count
     outputs:
       plugin: ${{ steps.paths.outputs.plugin }}
+      host: ${{ steps.paths.outputs.host }}
+      nightly: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
       reuse: ${{ steps.reuse.outputs.reuse }}
       reused-run: ${{ steps.reuse.outputs.run }}
     steps:
@@ -132,15 +139,18 @@ jobs:
           bash tests/session-start.test.sh
 
   # Installed-host qualification against each OS and Claude Code version: the
-  # minimum required by connect-once capture, and latest. A pull request
-  # skips macOS with the minimum version (macOS minutes cost ten times
-  # Linux's); merge groups and nightly runs keep all six, so every
-  # combination qualifies before a change reaches main (#140). A merge group
-  # that reuses its PR's run (#289) runs only that left-out leg.
+  # minimum required by connect-once capture, and latest. Pull requests and
+  # merge groups run both on Linux and latest on Windows; nightly and dispatched
+  # runs keep all six. Over 200 runs (2026-10-20 to 11-06) the Windows minimum
+  # failed alone once, on a torn-telemetry read Windows latest also hits; macOS
+  # latest never failed without Linux, and the macOS minimum never failed.
+  # unit (macos-latest) is the macOS check before merge. A change
+  # that cannot reach an installed host (changes.host false) runs Linux only.
+  # A merge group that reuses its PR's run (#289) runs none.
   native-host:
     name: native-host (${{ matrix.os }}, claude ${{ matrix.claude }})
     needs: changes
-    if: needs.changes.outputs.plugin == 'true'
+    if: needs.changes.outputs.plugin == 'true' && needs.changes.outputs.reuse != 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     strategy:
@@ -148,15 +158,13 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
         claude: ["2.1.280", latest]
-        # Outside a pull request the os never matches, so nothing is excluded.
+        # An os of 'none' never matches, so nothing is excluded.
         exclude:
-          - os: ${{ github.event_name == 'pull_request' && 'macos-latest' || 'none' }}
+          - os: ${{ needs.changes.outputs.nightly == 'true' && 'none' || 'macos-latest' }}
+          - os: ${{ needs.changes.outputs.nightly == 'true' && 'none' || 'windows-latest' }}
             claude: "2.1.280"
-          # On reuse, every leg but the one above: the PR run passed those.
-          - os: ${{ needs.changes.outputs.reuse == 'true' && 'ubuntu-latest' || 'none' }}
-          - os: ${{ needs.changes.outputs.reuse == 'true' && 'windows-latest' || 'none' }}
-          - os: ${{ needs.changes.outputs.reuse == 'true' && 'macos-latest' || 'none' }}
-            claude: latest
+          # Nothing an installed host loads changed: Linux is enough.
+          - os: ${{ needs.changes.outputs.host == 'false' && 'windows-latest' || 'none' }}
     defaults:
       run:
         shell: bash
@@ -192,10 +200,13 @@ jobs:
   # from Windows (.github/scripts/wsl-setup.sh). Steps run as an ordinary
   # user, as WSL users do: root ignores the file modes some tests check.
   # Latest Claude Code only; native-host covers the minimum on the other OSes.
+  # Nightly and dispatched runs only: it is the Linux build, and in 200 runs
+  # it never failed without a Linux leg failing too. The release checklist
+  # requires it green (docs/platform-matrix.md).
   wsl:
     name: wsl (ubuntu-24.04, claude latest)
     needs: changes
-    if: needs.changes.outputs.plugin == 'true' && needs.changes.outputs.reuse != 'true'
+    if: needs.changes.outputs.plugin == 'true' && needs.changes.outputs.reuse != 'true' && needs.changes.outputs.nightly == 'true'
     runs-on: windows-latest
     timeout-minutes: 20
     defaults:
@@ -356,6 +367,7 @@ jobs:
         env:
           CHANGES: ${{ needs.changes.result }}
           PLUGIN_AFFECTED: ${{ needs.changes.outputs.plugin }}
+          NIGHTLY: ${{ needs.changes.outputs.nightly }}
           # Only a merge group can reuse its PR's run (#289).
           REUSE: ${{ github.event_name == 'merge_group' && needs.changes.outputs.reuse || 'false' }}
           REUSED_RUN: ${{ needs.changes.outputs.reused-run }}
@@ -381,17 +393,19 @@ jobs:
           # cancelled if any leg was. The changes and always-on jobs must
           # succeed. unit, native-host, wsl and connected-failure may be skipped
           # only if the changes job succeeded and said the plugin is
-          # unaffected (#260); the connected job also on a fork PR. unit, wsl
-          # and connected-failure also if it said a merge group reuses its
-          # PR's run (#289); native-host still runs a leg then, so not it.
+          # unaffected (#260); the connected job also on a fork PR. All four
+          # also if it said a merge group reuses its PR's run (#289). wsl also
+          # on any run but a nightly or dispatched one, the only ones it runs on.
           for result in "$CHANGES" "$PROVENANCE" "$CHANNEL"; do
             [ "$result" = "success" ] || exit 1
           done
           accept() { python3 -I -B .github/scripts/ci_paths.py accept "$1" "$CHANGES" "$PLUGIN_AFFECTED" --reused "${2:-false}"; }
-          accept "$NATIVE_HOST" || exit 1
-          for result in "$UNIT" "$WSL"; do
+          for result in "$UNIT" "$NATIVE_HOST"; do
             accept "$result" "$REUSE" || exit 1
           done
+          wsl_may_skip=true
+          if [ "$NIGHTLY" = "true" ]; then wsl_may_skip=false; fi
+          accept "$WSL" "$wsl_may_skip" || exit 1
           if ! accept "$CONNECTED" "$REUSE"; then
             if [ "$FORK" != "true" ] || [ "$CONNECTED" != "skipped" ]; then exit 1; fi
           fi

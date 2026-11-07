@@ -17,7 +17,7 @@ from support import ROOT, load  # noqa: E402
 reuse = load(".github/scripts/ci_reuse.py")
 SCRIPT = ROOT / ".github/scripts/ci_reuse.py"
 
-REPO = "EDOS-Engineering/ork-meter-claude"
+REPO = "EDOS-Engineering/claude-plugin"
 BASE = "b" * 40
 HEAD = "a" * 40
 GROUP = "c" * 40
@@ -135,6 +135,8 @@ class Decide(unittest.TestCase):
     def test_a_failed_skipped_or_missing_job_runs_in_full(self):
         for name in JOBS:
             for conclusion in ("failure", "cancelled", "skipped", None):
+                if name.startswith(reuse.NIGHTLY_JOB_PREFIXES) and conclusion == "skipped":
+                    continue
                 with self.subTest(job=name, conclusion=conclusion):
                     def change(d, name=name, conclusion=conclusion):
                         for job in d[jobs_key()]["jobs"]:
@@ -142,7 +144,7 @@ class Decide(unittest.TestCase):
                                 job["conclusion"] = conclusion
                     self.assertFull(decide(edit(change)))
         for name in ("ci-gate", "unit (ubuntu-latest)", "native-host (ubuntu-latest, claude latest)",
-                     "wsl (ubuntu-24.04, claude latest)", "connected failure modes (linux)"):
+                     "connected failure modes (linux)"):
             with self.subTest(dropped=name):
                 def drop(d, name=name):
                     jobs = d[jobs_key()]
@@ -154,6 +156,16 @@ class Decide(unittest.TestCase):
                 self.assertFull(decide(edit(drop)))
         self.assertFull(decide(edit(lambda d: d[jobs_key()].update(total_count=len(JOBS) + 1))), "incomplete")
         self.assertFull(decide(edit(lambda d: d[jobs_key()].update(total_count=0, jobs=[]))), "incomplete")
+
+    def test_a_pull_request_run_that_skipped_wsl_is_reusable(self):
+        """wsl runs only on nightly and dispatched runs, so a PR run skips it."""
+        def skip(d):
+            for job in d[jobs_key()]["jobs"]:
+                if job["name"].startswith("wsl ("):
+                    job["conclusion"] = "skipped"
+        reused, url, _ = decide(edit(skip))
+        self.assertTrue(reused)
+        self.assertEqual(url, RUN_URL)
 
     def test_api_error_runs_in_full(self):
         for key in responses():
@@ -308,40 +320,36 @@ class Workflow(unittest.TestCase):
 
     def test_every_heavy_job_skips_on_reuse_and_nothing_else_does(self):
         gated = {name for name in job_names() if "needs.changes.outputs.reuse != 'true'" in job(name)}
-        self.assertEqual(gated, {"unit", "wsl", "connected-failure"})
+        self.assertEqual(gated, {"unit", "native-host", "wsl", "connected-failure"})
         for name in gated:
             with self.subTest(job=name):
                 condition = re.search(r"^    if: (>-\n(?:      .+\n)+|.+\n)", job(name), re.M).group(1)
                 self.assertIn("needs.changes.outputs.plugin == 'true' && needs.changes.outputs.reuse != 'true'",
                               " ".join(condition.split()))
-        # native-host narrows its matrix instead (ci_workflow_regressions.py
-        # checks the legs); the cheap always-on jobs never look at reuse.
-        self.assertNotIn("reuse != 'true'", job("native-host"))
-        self.assertEqual(job("native-host").count("needs.changes.outputs.reuse == 'true'"), 3)
         for name in ("runtime-provenance", "release-channel"):
             self.assertNotIn("reuse", job(name))
 
-    def test_ci_gate_accepts_reuse_only_on_merge_group_and_not_for_native_host(self):
+    def test_ci_gate_accepts_reuse_only_on_merge_group(self):
         gate = job("ci-gate")
         self.assertIn("          REUSE: ${{ github.event_name == 'merge_group' && needs.changes.outputs.reuse "
                       "|| 'false' }}\n", gate)
         script = gate_script()
-        self.assertIn('accept "$NATIVE_HOST" || exit 1\n', script)
-        self.assertIn('for result in "$UNIT" "$WSL"; do\n  accept "$result" "$REUSE" || exit 1\n', script)
+        self.assertIn('for result in "$UNIT" "$NATIVE_HOST"; do\n  accept "$result" "$REUSE" || exit 1\n', script)
         self.assertIn('if ! accept "$CONNECTED" "$REUSE"; then\n', script)
-        self.assertNotIn('"$NATIVE_HOST" "$REUSE"', script)
+        self.assertIn('if [ "$NIGHTLY" = "true" ]; then wsl_may_skip=false; fi\naccept "$WSL" "$wsl_may_skip" || exit 1\n', script)
 
     @unittest.skipIf(os.name == "nt", "the gate runs under Linux bash")
     def test_ci_gate_script_decisions(self):
         """Run ci-gate's script as Actions does (bash -eo pipefail)."""
-        reused = {"CHANGES": "success", "PLUGIN_AFFECTED": "true", "UNIT": "skipped", "NATIVE_HOST": "success",
+        reused = {"CHANGES": "success", "PLUGIN_AFFECTED": "true", "UNIT": "skipped", "NATIVE_HOST": "skipped",
                   "WSL": "skipped", "PROVENANCE": "success", "CHANNEL": "success", "CONNECTED": "skipped",
-                  "FORK": "false", "REUSE": "true", "REUSED_RUN": RUN_URL}
+                  "FORK": "false", "REUSE": "true", "REUSED_RUN": RUN_URL, "NIGHTLY": "false"}
         cases = [
             ({}, 0),
             ({"REUSE": "false"}, 1),
             ({"REUSE": ""}, 1),
-            ({"NATIVE_HOST": "skipped"}, 1),
+            ({"NATIVE_HOST": "failure"}, 1),
+            ({"REUSE": "false", "UNIT": "success", "CONNECTED": "success"}, 1),  # native-host may not skip
             ({"UNIT": "failure"}, 1),
             ({"WSL": "cancelled"}, 1),
             ({"CONNECTED": "failure"}, 1),
@@ -349,8 +357,15 @@ class Workflow(unittest.TestCase):
             ({"PROVENANCE": "skipped"}, 1),
             ({"CHANNEL": "failure"}, 1),
             # A full run is accepted as today.
-            ({"REUSE": "false", "UNIT": "success", "WSL": "success", "CONNECTED": "success"}, 0),
-            ({"REUSE": "false", "PLUGIN_AFFECTED": "false", "NATIVE_HOST": "skipped"}, 0),
+            ({"REUSE": "false", "UNIT": "success", "NATIVE_HOST": "success", "CONNECTED": "success"}, 0),
+            ({"REUSE": "false", "PLUGIN_AFFECTED": "false"}, 0),
+            # wsl must have run and passed on a nightly or dispatched run.
+            ({"REUSE": "false", "NIGHTLY": "true", "UNIT": "success", "NATIVE_HOST": "success",
+              "CONNECTED": "success", "WSL": "success"}, 0),
+            ({"REUSE": "false", "NIGHTLY": "true", "UNIT": "success", "NATIVE_HOST": "success",
+              "CONNECTED": "success", "WSL": "skipped"}, 1),
+            ({"REUSE": "false", "NIGHTLY": "true", "UNIT": "success", "NATIVE_HOST": "success",
+              "CONNECTED": "success", "WSL": "failure"}, 1),
         ]
         script = gate_script()
         for change, status in cases:
