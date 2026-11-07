@@ -3,8 +3,8 @@ name: follow-private-release
 # Starts the public release of every new private release: the private
 # repository holds only a read token, so this repository follows it. Each run
 # advances one step (.github/scripts/follow_release.py): public-sync, then
-# package-runtime, then publish-release, starting CI on and queueing the pull
-# requests they open. The production environment still gates each build and
+# package-runtime, then publish-release, starting CI on the pull requests they
+# open and opening an issue when a person must queue one. The production environment still gates each build and
 # publication, and a person still signs the tag. See docs/release.md, "Syncing
 # from development".
 
@@ -25,10 +25,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
+      contents: read
       actions: write # start the release workflows and CI on generated branches
-      contents: write # queue a generated pull request
       issues: write # report a release that stopped
-      pull-requests: write # queue a generated pull request
+      pull-requests: read # read the generated pull requests
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
