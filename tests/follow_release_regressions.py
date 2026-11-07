@@ -12,6 +12,8 @@ from support import ROOT, load  # noqa: E402,F401  (scrubs ORK_METER_*)
 follow = load(".github/scripts/follow_release.py")
 prepare = load(".github/scripts/prepare_sync.py")
 
+ARGS = ("sync",)
+
 
 def pr(checks="green", in_queue=False, ejected=False, queue_checks="pending"):
     return {"id": "ID", "number": 7, "branch": "sync/1.0.0", "in_queue": in_queue, "ejected": ejected, "checks": checks,
@@ -107,7 +109,7 @@ class Checks(unittest.TestCase):
 class OpenPullRequest(unittest.TestCase):
     def read(self, removed):
         answer = {"data": {"repository": {"pullRequests": {"nodes": [{
-            "id": "ID", "number": 7, "headRefName": "sync/1.0.0", "isInMergeQueue": False, "mergeQueueEntry": None,
+            "id": "ID", "number": 7, "headRefName": "sync/1.0.0", "isInMergeQueue": False,
             "timelineItems": {"totalCount": 9, "nodes": removed},
             "commits": {"nodes": [{"commit": {"statusCheckRollup": None}}]},
         }]}}}}
@@ -120,6 +122,33 @@ class OpenPullRequest(unittest.TestCase):
         # GitHub's totalCount ignores itemTypes, so only the nodes are evidence.
         self.assertFalse(self.read([])["ejected"])
         self.assertTrue(self.read([{"__typename": "RemovedFromMergeQueueEvent"}])["ejected"])
+
+    def queued(self, total_count):
+        def answer(*args, **kw):
+            if args[1].startswith("graphql"):
+                return json.dumps({"data": {"repository": {"pullRequests": {"nodes": [{
+                    "id": "ID", "number": 7, "headRefName": "sync/1.0.0", "isInMergeQueue": True,
+                    "timelineItems": {"nodes": []},
+                    "commits": {"nodes": [{"commit": {"statusCheckRollup": None}}]},
+                }]}}}})
+            if "matching-refs" in args[1]:
+                return json.dumps([{"ref": "refs/heads/gh-readonly-queue/main/pr-7-abc", "object": {"sha": "SHA"}}])
+            self.assertIn("/commits/SHA/check-runs", args[1])
+            return json.dumps({"total_count": total_count})
+        original = follow.gh
+        follow.gh = answer
+        self.addCleanup(setattr, follow, "gh", original)
+        return follow.open_pr("o/n", "sync/1.0.0")
+
+    def test_a_queue_commit_with_check_runs_is_not_started_again(self):
+        # GitHub's GraphQL rollup is null here even with check runs attached.
+        pull = self.queued(15)
+        self.assertEqual(pull["queue_checks"], "started")
+        self.assertEqual(follow.advance_pr(*ARGS, pull)[0][0], "wait")
+
+    def test_a_queue_commit_with_no_check_runs_gets_them_started(self):
+        pull = self.queued(0)
+        self.assertEqual(follow.advance_pr(*ARGS, pull), [("start-ci", "gh-readonly-queue/main/pr-7-abc")])
 
     def test_no_rollup_means_no_checks(self):
         self.assertEqual(self.read([])["checks"], "none")

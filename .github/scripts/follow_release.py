@@ -123,7 +123,6 @@ def run_state(repository, workflow, version):
 
 PR_QUERY = """query($owner:String!,$name:String!,$head:String!){repository(owner:$owner,name:$name){
 pullRequests(headRefName:$head,states:OPEN,first:1){nodes{id number headRefName isInMergeQueue
-mergeQueueEntry{headCommit{statusCheckRollup{contexts(first:100){nodes{... on CheckRun{name status conclusion}}}}}}
 timelineItems(itemTypes:[REMOVED_FROM_MERGE_QUEUE_EVENT],first:1){nodes{__typename}}
 commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){nodes{... on CheckRun{name status conclusion}}}}}}}}}}}"""
 
@@ -147,11 +146,13 @@ def open_pr(repository, branch):
     pr = nodes[0]
     rollup = pr["commits"]["nodes"][0]["commit"]["statusCheckRollup"]
     queue_branch, queue_checks = None, None
-    if pr["isInMergeQueue"] and pr["mergeQueueEntry"]:
+    if pr["isInMergeQueue"]:
         refs = json.loads(gh("api", f"repos/{repository}/git/matching-refs/heads/gh-readonly-queue/main/pr-{pr['number']}-"))
-        queue_branch = refs[0]["ref"].removeprefix("refs/heads/") if refs else None
-        queued = pr["mergeQueueEntry"]["headCommit"]["statusCheckRollup"]
-        queue_checks = checks_of(queued["contexts"]["nodes"] if queued else [])
+        if refs:
+            # REST, because GraphQL's rollup is null for a queue commit that has check runs.
+            runs = json.loads(gh("api", f"repos/{repository}/commits/{refs[0]['object']['sha']}/check-runs"))
+            queue_branch = refs[0]["ref"].removeprefix("refs/heads/")
+            queue_checks = "started" if runs["total_count"] else "none"
     return {"queue_branch": queue_branch, "queue_checks": queue_checks, "id": pr["id"], "number": pr["number"], "branch": pr["headRefName"], "in_queue": pr["isInMergeQueue"],
             "ejected": bool(pr["timelineItems"]["nodes"]), "checks": checks_of(rollup["contexts"]["nodes"] if rollup else [])}
 
