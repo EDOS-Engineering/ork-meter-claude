@@ -5,8 +5,7 @@ Usage: follow_release.py [--dry-run]
 
 Run on a schedule by follow-private-release.yml. The private repository holds
 only a read token, so this repository follows it rather than being pushed to.
-decide() is the whole policy; it starts workflows and queues pull requests, and
-the production environment still gates every build and publication. A person
+decide() is the whole policy; it starts workflows and CI, and the production environment still gates every build and publication. A person
 signs the tag, so a release stops there until the tag exists. A step that fails
 is never started again by this script: it opens one issue and waits.
 
@@ -36,10 +35,6 @@ def advance_pr(kind, pr):
     if pr["ejected"]:
         return [("notify", f"the {kind} pull request #{pr['number']} left the merge queue without merging")]
     if pr["in_queue"]:
-        # A pull request queued with GITHUB_TOKEN gets no merge_group run, so
-        # the queue commit's checks must be started by hand.
-        if pr["queue_branch"] and pr["queue_checks"] == "none":
-            return [("start-ci", pr["queue_branch"])]
         return [("wait", f"{kind} pull request #{pr['number']} is in the merge queue")]
     if pr["checks"] == "none":
         return [("start-ci", pr["branch"])]
@@ -47,7 +42,9 @@ def advance_pr(kind, pr):
         return [("notify", f"the {kind} pull request #{pr['number']} failed its checks")]
     if pr["checks"] == "pending":
         return [("wait", f"{kind} pull request #{pr['number']} is being checked")]
-    return [("enqueue", pr["id"])]
+    # A pull request queued with GITHUB_TOKEN gets no merge_group run and jams the
+    # queue, so a person queues it.
+    return [("notify", f"queue the {kind} pull request #{pr['number']}")]
 
 
 def advance_run(workflow, version, run, pr_kind=None):
@@ -145,15 +142,7 @@ def open_pr(repository, branch):
         return None
     pr = nodes[0]
     rollup = pr["commits"]["nodes"][0]["commit"]["statusCheckRollup"]
-    queue_branch, queue_checks = None, None
-    if pr["isInMergeQueue"]:
-        refs = json.loads(gh("api", f"repos/{repository}/git/matching-refs/heads/gh-readonly-queue/main/pr-{pr['number']}-"))
-        if refs:
-            # REST, because GraphQL's rollup is null for a queue commit that has check runs.
-            runs = json.loads(gh("api", f"repos/{repository}/commits/{refs[0]['object']['sha']}/check-runs"))
-            queue_branch = refs[0]["ref"].removeprefix("refs/heads/")
-            queue_checks = "started" if runs["total_count"] else "none"
-    return {"queue_branch": queue_branch, "queue_checks": queue_checks, "id": pr["id"], "number": pr["number"], "branch": pr["headRefName"], "in_queue": pr["isInMergeQueue"],
+    return {"id": pr["id"], "number": pr["number"], "branch": pr["headRefName"], "in_queue": pr["isInMergeQueue"],
             "ejected": bool(pr["timelineItems"]["nodes"]), "checks": checks_of(rollup["contexts"]["nodes"] if rollup else [])}
 
 
@@ -225,8 +214,6 @@ def main(argv=None):
             dispatch(repository, detail, state["version"], token)
         elif action == "start-ci":
             gh("workflow", "run", "ci.yml", "-R", repository, "--ref", detail)
-        elif action == "enqueue":
-            gh("api", "graphql", "-f", "query=mutation($id:ID!){enqueuePullRequest(input:{pullRequestId:$id}){clientMutationId}}", "-F", f"id={detail}")
     if not dry_run:
         sync_issue(repository, message, state.get("version"))
     return 0

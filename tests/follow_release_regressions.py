@@ -12,12 +12,10 @@ from support import ROOT, load  # noqa: E402,F401  (scrubs ORK_METER_*)
 follow = load(".github/scripts/follow_release.py")
 prepare = load(".github/scripts/prepare_sync.py")
 
-ARGS = ("sync",)
 
 
-def pr(checks="green", in_queue=False, ejected=False, queue_checks="pending"):
-    return {"id": "ID", "number": 7, "branch": "sync/1.0.0", "in_queue": in_queue, "ejected": ejected, "checks": checks,
-            "queue_branch": "gh-readonly-queue/main/pr-7-abc" if in_queue else None, "queue_checks": queue_checks if in_queue else None}
+def pr(checks="green", in_queue=False, ejected=False):
+    return {"id": "ID", "number": 7, "branch": "sync/1.0.0", "in_queue": in_queue, "ejected": ejected, "checks": checks}
 
 
 def state(**changes):
@@ -38,8 +36,8 @@ class Decide(unittest.TestCase):
     def test_released_is_done_and_changes_nothing(self):
         self.assertEqual(self.action(released=True, main_version="1.0.0")[0], "done")
 
-    def test_released_with_a_marketplace_pull_request_queues_it(self):
-        self.assertEqual(self.action(released=True, prs={"channel": pr()}), ("enqueue", "ID"))
+    def test_released_with_a_marketplace_pull_request_asks_for_it(self):
+        self.assertIn("queue the", self.action(released=True, prs={"channel": pr()})[1])
 
     def test_main_past_the_private_release_is_left_alone(self):
         self.assertEqual(self.action(main_version="1.1.0-dev")[0], "done")
@@ -65,12 +63,9 @@ class Decide(unittest.TestCase):
     def test_a_pull_request_being_checked_waits(self):
         self.assertEqual(self.action(prs={"sync": pr("pending")})[0], "wait")
 
-    def test_a_green_pull_request_is_queued_once(self):
-        self.assertEqual(self.action(prs={"sync": pr()}), ("enqueue", "ID"))
+    def test_a_green_pull_request_asks_a_person_to_queue_it(self):
+        self.assertIn("queue the", self.action(prs={"sync": pr()})[1])
         self.assertEqual(self.action(prs={"sync": pr(in_queue=True)})[0], "wait")
-
-    def test_a_queued_pull_request_with_no_checks_gets_them_started_on_the_queue_branch(self):
-        self.assertEqual(self.action(prs={"sync": pr(in_queue=True, queue_checks="none")}), ("start-ci", "gh-readonly-queue/main/pr-7-abc"))
 
     def test_a_red_or_ejected_pull_request_notifies_and_is_not_requeued(self):
         self.assertEqual(self.action(prs={"sync": pr("failed")})[0], "notify")
@@ -80,7 +75,7 @@ class Decide(unittest.TestCase):
         self.assertEqual(self.action(main_version="1.0.0-dev"), ("dispatch", "package-runtime"))
 
     def test_an_open_release_pull_request_advances(self):
-        self.assertEqual(self.action(main_version="1.0.0-dev", prs={"release": pr()}), ("enqueue", "ID"))
+        self.assertIn("queue the", self.action(main_version="1.0.0-dev", prs={"release": pr()})[1])
 
     def test_a_merged_release_waits_for_a_person_to_sign(self):
         action = self.action(main_version="1.0.0")
@@ -122,33 +117,6 @@ class OpenPullRequest(unittest.TestCase):
         # GitHub's totalCount ignores itemTypes, so only the nodes are evidence.
         self.assertFalse(self.read([])["ejected"])
         self.assertTrue(self.read([{"__typename": "RemovedFromMergeQueueEvent"}])["ejected"])
-
-    def queued(self, total_count):
-        def answer(*args, **kw):
-            if args[1].startswith("graphql"):
-                return json.dumps({"data": {"repository": {"pullRequests": {"nodes": [{
-                    "id": "ID", "number": 7, "headRefName": "sync/1.0.0", "isInMergeQueue": True,
-                    "timelineItems": {"nodes": []},
-                    "commits": {"nodes": [{"commit": {"statusCheckRollup": None}}]},
-                }]}}}})
-            if "matching-refs" in args[1]:
-                return json.dumps([{"ref": "refs/heads/gh-readonly-queue/main/pr-7-abc", "object": {"sha": "SHA"}}])
-            self.assertIn("/commits/SHA/check-runs", args[1])
-            return json.dumps({"total_count": total_count})
-        original = follow.gh
-        follow.gh = answer
-        self.addCleanup(setattr, follow, "gh", original)
-        return follow.open_pr("o/n", "sync/1.0.0")
-
-    def test_a_queue_commit_with_check_runs_is_not_started_again(self):
-        # GitHub's GraphQL rollup is null here even with check runs attached.
-        pull = self.queued(15)
-        self.assertEqual(pull["queue_checks"], "started")
-        self.assertEqual(follow.advance_pr(*ARGS, pull)[0][0], "wait")
-
-    def test_a_queue_commit_with_no_check_runs_gets_them_started(self):
-        pull = self.queued(0)
-        self.assertEqual(follow.advance_pr(*ARGS, pull), [("start-ci", "gh-readonly-queue/main/pr-7-abc")])
 
     def test_no_rollup_means_no_checks(self):
         self.assertEqual(self.read([])["checks"], "none")

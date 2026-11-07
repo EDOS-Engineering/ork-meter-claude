@@ -107,16 +107,17 @@ and advances one step (`.github/scripts/follow_release.py`):
    version's runtime pins. The run validates the plugin, runs `tests/run.sh`,
    pushes `sync/<version>` and opens **sync: &lt;version&gt; from &lt;private
    sha&gt;**. It never pushes to `main`, never tags and never publishes.
-2. It starts CI on the pull request if none started, and queues it when
-   `ci-gate` is green. A pull request queued with `GITHUB_TOKEN` gets no
-   `merge_group` run, so it also starts CI on the queue branch.
+2. It starts CI on the pull request if none started. When `ci-gate` is green it
+   opens an issue asking a person to queue it. A pull request queued with
+   `GITHUB_TOKEN` gets no `merge_group` run and jams the queue until its 30-minute
+   limit, so the workflow never queues one.
 3. It dispatches **package-runtime** with the private release's runtime ref. This
    waits for `production` approval.
-4. It starts CI on the release pull request and queues it the same way.
+4. It handles the release pull request the same way.
 5. It opens an issue asking a person to sign the tag `v<version>` on the merged
    release commit, and stops until the tag exists.
 6. It dispatches **publish-release**. This waits for `production` approval.
-7. It starts CI on the marketplace pull request and queues it the same way.
+7. It handles the marketplace pull request the same way.
 
 A step that fails is not started again. The run opens one issue titled
 `Release follow: ...` and waits; once the cause is fixed, re-run the failed
@@ -223,8 +224,8 @@ What the workflow does, in order:
     downloadable assets (next section), then opens the pull request
     `release: point the marketplace at v<version>` from the branch
     `release-channel/v<version>`.
-12. **follow-private-release** starts CI on that pull request and queues it
-    when `ci-gate` is green (Jeremy's decision, 2026-11-06). **This is when
+12. **follow-private-release** starts CI on that pull request if needed and asks
+    a person to queue it when `ci-gate` is green. **This is when
     customers of this marketplace get the release.** Canary evidence and the
     platform walkthroughs ([platform-matrix.md](platform-matrix.md)) are not a
     precondition; run them when a release calls for them.
