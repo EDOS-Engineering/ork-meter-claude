@@ -71,6 +71,7 @@ sys.exit(1)
 
 
 @unittest.skipUnless(shutil.which("bash"), "needs bash")
+@unittest.skipIf(os.name == "nt", "the workflow steps run under Linux bash on ubuntu runners")
 class StepScripts(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
