@@ -47,15 +47,14 @@ class Invocation:
             directory = target if target else session.Store.for_payload(self.payload).path
             session.private_dir(directory)
             path = os.path.join(directory, 'hook-invocations.jsonl')
-            fd = os.open(session.fs_path(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND |
-                         getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0), 0o600)
+            fd = session.open_append(path, getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
             try:
                 info = os.fstat(fd)
                 if not stat.S_ISREG(info.st_mode) or (hasattr(os, 'getuid') and info.st_uid != os.getuid()):
                     return
                 if hasattr(os, 'getuid') and stat.S_IMODE(info.st_mode) & 0o077:   # no POSIX mode bits on Windows
                     return
-                raw = (json.dumps(self.row, separators=(',', ':'))+'\n').encode()
+                raw = (json.dumps(self.row, separators=(',', ':'))+os.linesep).encode()
                 if info.st_size + len(raw) > MAX_BYTES:
                     return
                 os.write(fd, raw)

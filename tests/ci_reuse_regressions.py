@@ -17,7 +17,7 @@ from support import ROOT, load  # noqa: E402
 reuse = load(".github/scripts/ci_reuse.py")
 SCRIPT = ROOT / ".github/scripts/ci_reuse.py"
 
-REPO = "EDOS-Engineering/claude-plugin"
+REPO = "EDOS-Engineering/ork-meter-claude"
 BASE = "b" * 40
 HEAD = "a" * 40
 GROUP = "c" * 40
