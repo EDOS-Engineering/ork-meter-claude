@@ -23,7 +23,8 @@ It answers ``true`` only when every one of these holds:
 4. Exactly one ``ci`` run exists for the PR head SHA on pull_request. It is
    completed with conclusion success and comes from this repository, and
    every job of its latest attempt succeeded: ci-gate and at least one leg of
-   each heavy job, none skipped (a docs-only or fork run skipped some).
+   each heavy job, none skipped (a docs-only or fork run skipped some) but
+   wsl, which runs only on nightly and dispatched runs.
 
 Anything else, including an API error, missing or unexpected data, more than
 one run, or a run that is queued, in progress (a re-run) or did not succeed,
@@ -41,7 +42,9 @@ WORKFLOW_PATH = ".github/workflows/" + WORKFLOW
 GATE_JOB = "ci-gate"
 # The job names ci.yml gives the heavy jobs a reuse skips or narrows; the PR
 # run must have run (and passed) at least one job with each prefix.
-HEAVY_JOB_PREFIXES = ("unit (", "native-host (", "wsl (", "connected failure modes")
+HEAVY_JOB_PREFIXES = ("unit (", "native-host (", "connected failure modes")
+# A job pull requests skip by design; if one ran, it must still have passed.
+NIGHTLY_JOB_PREFIXES = ("wsl (",)
 HEAD_REF_RE = re.compile(r"^(?:refs/heads/)?gh-readonly-queue/(?P<base>.+)/pr-(?P<number>[1-9][0-9]*)-[0-9a-f]{40}$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
@@ -142,7 +145,9 @@ def check(api, repo, event, head_ref, head_sha, base_sha):
     names = []
     for job in job_list:
         name = _get(job, "name")
-        if _get(job, "status") != "completed" or _get(job, "conclusion") != "success":
+        conclusion = _get(job, "conclusion")
+        nightly_only = isinstance(name, str) and name.startswith(NIGHTLY_JOB_PREFIXES)
+        if _get(job, "status") != "completed" or (conclusion != "success" and not (nightly_only and conclusion == "skipped")):
             raise Refuse("run %s job %r is %s/%s" % (url, name, _get(job, "status"), _get(job, "conclusion")))
         names.append(name)
     if GATE_JOB not in names:
