@@ -36,6 +36,10 @@ def advance_pr(kind, pr):
     if pr["ejected"]:
         return [("notify", f"the {kind} pull request #{pr['number']} left the merge queue without merging")]
     if pr["in_queue"]:
+        # A pull request queued with GITHUB_TOKEN gets no merge_group run, so
+        # the queue commit's checks must be started by hand.
+        if pr["queue_branch"] and pr["queue_checks"] == "none":
+            return [("start-ci", pr["queue_branch"])]
         return [("wait", f"{kind} pull request #{pr['number']} is in the merge queue")]
     if pr["checks"] == "none":
         return [("start-ci", pr["branch"])]
@@ -119,6 +123,7 @@ def run_state(repository, workflow, version):
 
 PR_QUERY = """query($owner:String!,$name:String!,$head:String!){repository(owner:$owner,name:$name){
 pullRequests(headRefName:$head,states:OPEN,first:1){nodes{id number headRefName isInMergeQueue
+mergeQueueEntry{headCommit{statusCheckRollup{contexts(first:100){nodes{... on CheckRun{name status conclusion}}}}}}
 timelineItems(itemTypes:[REMOVED_FROM_MERGE_QUEUE_EVENT],first:1){nodes{__typename}}
 commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){nodes{... on CheckRun{name status conclusion}}}}}}}}}}}"""
 
@@ -141,7 +146,13 @@ def open_pr(repository, branch):
         return None
     pr = nodes[0]
     rollup = pr["commits"]["nodes"][0]["commit"]["statusCheckRollup"]
-    return {"id": pr["id"], "number": pr["number"], "branch": pr["headRefName"], "in_queue": pr["isInMergeQueue"],
+    queue_branch, queue_checks = None, None
+    if pr["isInMergeQueue"] and pr["mergeQueueEntry"]:
+        refs = json.loads(gh("api", f"repos/{repository}/git/matching-refs/heads/gh-readonly-queue/main/pr-{pr['number']}-"))
+        queue_branch = refs[0]["ref"].removeprefix("refs/heads/") if refs else None
+        queued = pr["mergeQueueEntry"]["headCommit"]["statusCheckRollup"]
+        queue_checks = checks_of(queued["contexts"]["nodes"] if queued else [])
+    return {"queue_branch": queue_branch, "queue_checks": queue_checks, "id": pr["id"], "number": pr["number"], "branch": pr["headRefName"], "in_queue": pr["isInMergeQueue"],
             "ejected": bool(pr["timelineItems"]["nodes"]), "checks": checks_of(rollup["contexts"]["nodes"] if rollup else [])}
 
 

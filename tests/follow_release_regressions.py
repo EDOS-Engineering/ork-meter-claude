@@ -13,8 +13,9 @@ follow = load(".github/scripts/follow_release.py")
 prepare = load(".github/scripts/prepare_sync.py")
 
 
-def pr(checks="green", in_queue=False, ejected=False):
-    return {"id": "ID", "number": 7, "branch": "sync/1.0.0", "in_queue": in_queue, "ejected": ejected, "checks": checks}
+def pr(checks="green", in_queue=False, ejected=False, queue_checks="pending"):
+    return {"id": "ID", "number": 7, "branch": "sync/1.0.0", "in_queue": in_queue, "ejected": ejected, "checks": checks,
+            "queue_branch": "gh-readonly-queue/main/pr-7-abc" if in_queue else None, "queue_checks": queue_checks if in_queue else None}
 
 
 def state(**changes):
@@ -66,6 +67,9 @@ class Decide(unittest.TestCase):
         self.assertEqual(self.action(prs={"sync": pr()}), ("enqueue", "ID"))
         self.assertEqual(self.action(prs={"sync": pr(in_queue=True)})[0], "wait")
 
+    def test_a_queued_pull_request_with_no_checks_gets_them_started_on_the_queue_branch(self):
+        self.assertEqual(self.action(prs={"sync": pr(in_queue=True, queue_checks="none")}), ("start-ci", "gh-readonly-queue/main/pr-7-abc"))
+
     def test_a_red_or_ejected_pull_request_notifies_and_is_not_requeued(self):
         self.assertEqual(self.action(prs={"sync": pr("failed")})[0], "notify")
         self.assertEqual(self.action(prs={"sync": pr(ejected=True)})[0], "notify")
@@ -103,7 +107,7 @@ class Checks(unittest.TestCase):
 class OpenPullRequest(unittest.TestCase):
     def read(self, removed):
         answer = {"data": {"repository": {"pullRequests": {"nodes": [{
-            "id": "ID", "number": 7, "headRefName": "sync/1.0.0", "isInMergeQueue": False,
+            "id": "ID", "number": 7, "headRefName": "sync/1.0.0", "isInMergeQueue": False, "mergeQueueEntry": None,
             "timelineItems": {"totalCount": 9, "nodes": removed},
             "commits": {"nodes": [{"commit": {"statusCheckRollup": None}}]},
         }]}}}}

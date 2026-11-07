@@ -108,7 +108,8 @@ and advances one step (`.github/scripts/follow_release.py`):
    pushes `sync/<version>` and opens **sync: &lt;version&gt; from &lt;private
    sha&gt;**. It never pushes to `main`, never tags and never publishes.
 2. It starts CI on the pull request if none started, and queues it when
-   `ci-gate` is green.
+   `ci-gate` is green. A pull request queued with `GITHUB_TOKEN` gets no
+   `merge_group` run, so it also starts CI on the queue branch.
 3. It dispatches **package-runtime** with the private release's runtime ref. This
    waits for `production` approval.
 4. It starts CI on the release pull request and queues it the same way.
