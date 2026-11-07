@@ -1,5 +1,5 @@
 name: publish-release
-run-name: publish-release ${{ inputs.plugin_version }}
+run-name: publish-release ${{ inputs.plugin_version || github.ref_name }}
 
 # Publishes the GitHub Release for a plugin version that is already merged to
 # `main` and tagged v<version> by a human (docs/release.md, "Cutting a
@@ -19,33 +19,77 @@ run-name: publish-release ${{ inputs.plugin_version }}
 # tag, turns the Release back into a draft and fails, but that tag stays until
 # a human removes it (docs/release.md, "Signed release tags"). Afterwards the
 # point-marketplace job opens the pull request that moves the marketplace to
-# the new tag, which is what makes the release installable; a person queues it
-# when follow-private-release asks (docs/release.md, "Release channel"). That job never pushes to main and
-# never pushes a tag. Manual dispatch only, from `main`, behind the protected
+# the new tag, which is what makes the release installable; it is opened with
+# a GitHub App token so that its CI starts, and a person queues it
+# (docs/release.md, "Release channel"). That job never pushes to main and
+# never pushes a tag. The release-pages job then starts ork-meter's
+# plugin-releases workflow, which copies the new Release to the site.
+#
+# A person pushing the signed tag v<version> starts it. The production
+# environment allows only main, and GitHub matches it against the run's ref, so
+# a tag-push run cannot deploy: its start job only dispatches this workflow on
+# main for that version (a workflow_dispatch event, which GITHUB_TOKEN may
+# start), and does nothing if the Release is already published. The
+# publication itself runs only on dispatch, from `main`, behind the protected
 # `production` environment: publication is a reviewed release operation
 # (CONTRIBUTING, condition 3). See docs/release.md, "Publishing the GitHub
 # Release".
 
 on:
+  push:
+    tags: ["v*"]
   workflow_dispatch:
     inputs:
       plugin_version:
         description: "plugin version to publish (semver, e.g. 0.3.0); the tag v<version> must already exist on main"
         required: true
         type: string
+      requested_by:
+        description: "GitHub login that pushed the tag; set by the tag push, leave empty when dispatching by hand"
+        required: false
+        type: string
 
 permissions:
   contents: read
 
-# One release publication at a time.
+# One release publication at a time. A tag push's run only dispatches, so it has
+# a group of its own and can never cancel a pending publication.
 concurrency:
-  group: publish-release
+  group: ${{ github.event_name == 'push' && format('publish-release-{0}', github.ref) || 'publish-release' }}
   cancel-in-progress: false
 
 jobs:
+  start:
+    name: start the publication of the pushed tag
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: write # dispatch this workflow on main
+    steps:
+      - name: Dispatch publish-release on main unless the Release is published
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          PUSHER: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::notice::$TAG is not a release tag v<major>.<minor>.<patch>; nothing to publish"; exit 0
+          fi
+          # Published Releases only: a draft left by a failed run still goes to the
+          # publish job, which refuses it with the instructions to delete it.
+          if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --silent 2>/dev/null; then
+            echo "::notice::the GitHub Release $TAG is already published; nothing to do"; exit 0
+          fi
+          gh workflow run publish-release.yml -R "$GITHUB_REPOSITORY" --ref main \
+            -f plugin_version="${TAG#v}" -f requested_by="$PUSHER"
+          echo "::notice::dispatched publish-release ${TAG#v} on main; it waits for production approval"
+
   verify:
     name: verify tests and production gate
-    if: github.ref == 'refs/heads/main'
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -77,7 +121,7 @@ jobs:
 
   publish:
     needs: verify
-    if: github.ref == 'refs/heads/main'
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
     environment: production
     name: publish GitHub Release v${{ inputs.plugin_version }}
     runs-on: ubuntu-latest
@@ -93,6 +137,8 @@ jobs:
       commit: ${{ steps.release.outputs.commit }}
     env:
       PLUGIN_VERSION: ${{ inputs.plugin_version }}
+      # The person who pushed the tag, or who dispatched this run by hand.
+      DISPATCHER: ${{ inputs.requested_by || github.actor }}
     steps:
       - name: Check out the plugin with its tags
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -108,6 +154,9 @@ jobs:
           set -euo pipefail
           if ! printf '%s' "$PLUGIN_VERSION" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'; then
             echo "::error::plugin_version '$PLUGIN_VERSION' is not semver (expected e.g. 0.3.0)."; exit 1
+          fi
+          if ! [[ "$DISPATCHER" =~ ^[A-Za-z0-9][A-Za-z0-9-]*(\[bot\])?$ ]]; then
+            echo "::error::requested_by '$DISPATCHER' is not a GitHub login."; exit 1
           fi
           tag="v$PLUGIN_VERSION"
           if ! git rev-parse -q --verify "refs/tags/$tag^{commit}" >/dev/null; then
@@ -252,7 +301,6 @@ jobs:
           TAG_OBJECT: ${{ steps.release.outputs.tag_object }}
           COMMIT: ${{ steps.release.outputs.commit }}
           ORK_METER_REF: ${{ steps.release.outputs.ork_meter_ref }}
-          DISPATCHER: ${{ github.actor }}
         run: |
           set -euo pipefail
           release="$RUNNER_TEMP/release"
@@ -388,20 +436,33 @@ jobs:
   # "Release channel"). This opens that pull request; it does not merge it.
   point-marketplace:
     needs: publish
-    if: github.ref == 'refs/heads/main'
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
     name: open the pull request pointing the marketplace at v${{ inputs.plugin_version }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
-      contents: write # push the pull request's own branch, release-channel/v<version>; never main, never a tag
-      pull-requests: write # open that pull request against main
+      contents: read # the App token below pushes the branch and opens the pull request
     env:
       PLUGIN_VERSION: ${{ inputs.plugin_version }}
     steps:
+      # GitHub starts no workflow for GITHUB_TOKEN events, so a pull request
+      # opened with it gets no CI. An App token limited to this repository opens it;
+      # it pushes only release-channel/v<version>, never main, never a tag.
+      - name: Mint a token for this repository
+        id: app
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+        with:
+          app-id: ${{ vars.ORK_GITHUB_APP_ID }}
+          private-key: ${{ secrets.ORK_GITHUB_APP_PRIVATE_KEY_PEM }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-pull-requests: write
       - name: Check out main with its tags
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0 # the tag and main's history for the ancestry check
+          token: ${{ steps.app.outputs.token }}
 
       # Re-resolve nothing on trust: the tag must still be the object the
       # publish job verified, and still pass the signature check (main's copy).
@@ -423,8 +484,9 @@ jobs:
       - name: Open the pull request
         env:
           COMMIT: ${{ needs.publish.outputs.commit }}
-          DISPATCHER: ${{ github.actor }}
-          GH_TOKEN: ${{ github.token }}
+          DISPATCHER: ${{ inputs.requested_by || github.actor }}
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          APP_SLUG: ${{ steps.app.outputs.app-slug }}
         run: |
           set -euo pipefail
           tag="v$PLUGIN_VERSION"
@@ -432,8 +494,9 @@ jobs:
           if git ls-remote --exit-code --heads origin "refs/heads/$branch" >/dev/null; then
             echo "::error::branch $branch already exists; a pull request pointing the marketplace at $tag is open or was abandoned."; exit 1
           fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          user_id=$(gh api "/users/${APP_SLUG}[bot]" --jq .id)
+          git config user.name "${APP_SLUG}[bot]"
+          git config user.email "${user_id}+${APP_SLUG}[bot]@users.noreply.github.com"
           git checkout -b "$branch"
           python3 -I -B .github/scripts/point-marketplace.py set "$PLUGIN_VERSION"
           if git diff --quiet; then
@@ -471,8 +534,6 @@ jobs:
             echo "- workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
             echo
             echo "Merge it once the release has been installed and checked on each platform (docs/release.md, \"What this process does not cover\"). To roll back later, point the marketplace at an earlier tag the same way (docs/release.md, \"Rollback\")."
-            echo
-            echo "GitHub does not run CI on a pull request this workflow opens; close and reopen it to run \`ci\`."
           } > "$RUNNER_TEMP/pr-body"
           url=$(gh pr create --base main --head "$branch" \
             --title "release: point the marketplace at $tag" --body-file "$RUNNER_TEMP/pr-body")
@@ -482,3 +543,27 @@ jobs:
             echo "- pull request: $url"
             echo "- next: install and check $tag, then merge it; that is when customers get $PLUGIN_VERSION"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # The site's version pages read this Release. Start the job that copies it
+  # there instead of waiting for anything to notice.
+  release-pages:
+    needs: publish
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    name: start the site's plugin release sync
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Mint a token to start ork-meter's plugin-releases workflow
+        id: site
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+        with:
+          app-id: ${{ vars.ORK_GITHUB_APP_ID }}
+          private-key: ${{ secrets.ORK_GITHUB_APP_PRIVATE_KEY_PEM }}
+          owner: ${{ github.repository_owner }}
+          repositories: ork-meter
+          permission-actions: write
+      - name: Start plugin-releases on ork-meter
+        env:
+          GH_TOKEN: ${{ steps.site.outputs.token }}
+        run: gh workflow run plugin-releases.yml -R "$GITHUB_REPOSITORY_OWNER/ork-meter" --ref main

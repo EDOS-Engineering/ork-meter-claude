@@ -3,18 +3,23 @@ run-name: public-sync ${{ inputs.version }}
 
 # Proposes a released version of the private development repository,
 # EDOS-Engineering/claude-plugin, as a pull request here.
-# follow-private-release starts it after the private release is published. It checks out the private
+# The private repository's deliver-release.py starts it once orkmeter.com serves
+# the release (follow-private-release can start it by hand). It does nothing if
+# main already carries this version or a later one, or sync/<version> is already
+# proposed: delivering an earlier release is the private rollback, and must not
+# propose a downgrade here. It checks out the private
 # repository at its signed tag v<version> with the read-only
 # ORK_METER_READ_TOKEN, verifies the tag with this repository's tag check and
 # allowed signers (from main), runs that tag's scripts/sync_public.py against
 # this repository's main (the private manifest decides what is mirrored, what
 # this repository owns and what must never leave the private repository; any
 # leak refuses the run), validates the plugin and runs the tests, then pushes
-# sync/<version> and opens "sync: <version> from <private sha>" with this
-# repository's own GITHUB_TOKEN. It never pushes to main, never tags and never
-# publishes: the release here (package-runtime, then publish-release) follows
-# after a human merges the sync pull request (docs/release.md). Nothing here
-# runs on push.
+# sync/<version> and opens "sync: <version> from <private sha>" with a GitHub
+# App token, not GITHUB_TOKEN: GitHub starts no workflow for GITHUB_TOKEN
+# events, so a pull request opened with it would get no CI. It never pushes to
+# main, never tags and never publishes: a person queues the pull request, and
+# its merge starts package-runtime (docs/release.md, "Syncing from
+# development"). Nothing here runs on push.
 
 on:
   workflow_dispatch:
@@ -35,8 +40,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
-      contents: write
-      pull-requests: write
+      contents: read # the App token below pushes the branch and opens the pull request
     env:
       VERSION: ${{ inputs.version }}
       PRIVATE_REPOSITORY: EDOS-Engineering/claude-plugin
@@ -45,13 +49,50 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::version must be semver, got $VERSION"; exit 1; }
+      - name: Stop if main has this version or a later one, or it is proposed
+        id: needed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          main=$(gh api "repos/$GITHUB_REPOSITORY/contents/.claude-plugin/plugin.json?ref=main" -H "Accept: application/vnd.github.raw+json" \
+            | python3 -I -c 'import json, sys; print(json.load(sys.stdin)["version"])')
+          behind=$(python3 -I -c 'import sys; n = lambda v: tuple(int(p) for p in v.split("-")[0].split(".")); print(n(sys.argv[1]) < n(sys.argv[2]))' "$main" "$VERSION")
+          proposed=$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/heads/sync/$VERSION" --jq "[.[] | select(.ref == \"refs/heads/sync/$VERSION\")] | length")
+          if [ "$behind" != "True" ]; then
+            echo "::notice::main is at $main, not behind $VERSION; nothing to propose"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          elif [ "$proposed" != "0" ]; then
+            echo "::notice::sync/$VERSION already exists; it is proposed already"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+      # The sync pull request is opened with this token so that GitHub starts its
+      # CI. Workflows: .github/workflows is a mirrored path, so a sync may carry a
+      # workflow file, and pushing one needs that permission.
+      - name: Mint a token for this repository
+        id: app
+        if: steps.needed.outputs.run == 'true'
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+        with:
+          app-id: ${{ vars.ORK_GITHUB_APP_ID }}
+          private-key: ${{ secrets.ORK_GITHUB_APP_PRIVATE_KEY_PEM }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-workflows: write
       - name: Check out main
+        if: steps.needed.outputs.run == 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
           path: public
+          token: ${{ steps.app.outputs.token }}
           persist-credentials: true
       - name: Check out the released private tree
+        if: steps.needed.outputs.run == 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ env.PRIVATE_REPOSITORY }}
@@ -63,6 +104,7 @@ jobs:
       # Main's tag check and allowed signers: the tag's own tree cannot vouch
       # for its own signature.
       - name: Verify the signed tag and the plugin version
+        if: steps.needed.outputs.run == 'true'
         working-directory: private
         run: |
           set -euo pipefail
@@ -73,6 +115,7 @@ jobs:
           test -f scripts/sync_public.py || { echo "::error::v$VERSION has no scripts/sync_public.py"; exit 1; }
           echo "PRIVATE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
       - name: Sync (refuses any private leak)
+        if: steps.needed.outputs.run == 'true'
         run: |
           set -euo pipefail
           python3 -I -B private/scripts/sync_public.py --public public --report "$RUNNER_TEMP/sync.json"
@@ -82,27 +125,28 @@ jobs:
             echo "NOTHING_TO_SYNC=1" >> "$GITHUB_ENV"
           fi
       - name: Drop the private checkout
+        if: steps.needed.outputs.run == 'true'
         run: rm -rf private
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        if: env.NOTHING_TO_SYNC != '1'
+        if: steps.needed.outputs.run == 'true' && env.NOTHING_TO_SYNC != '1'
         with:
           node-version: 22
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
-        if: env.NOTHING_TO_SYNC != '1'
+        if: steps.needed.outputs.run == 'true' && env.NOTHING_TO_SYNC != '1'
         with:
           python-version: "3.10"
       - name: Install the pinned hook tokenizer
-        if: env.NOTHING_TO_SYNC != '1'
+        if: steps.needed.outputs.run == 'true' && env.NOTHING_TO_SYNC != '1'
         working-directory: public
         run: |
           python -m pip install --require-hashes --only-binary=:all: -r requirements-hooks.txt
       - name: Install Claude Code for plugin validation
-        if: env.NOTHING_TO_SYNC != '1'
+        if: steps.needed.outputs.run == 'true' && env.NOTHING_TO_SYNC != '1'
         uses: ./public/.github/actions/install-claude
         with:
           version: latest
       - name: Validate and test the synced tree
-        if: env.NOTHING_TO_SYNC != '1'
+        if: steps.needed.outputs.run == 'true' && env.NOTHING_TO_SYNC != '1'
         working-directory: public
         run: |
           set -euo pipefail
@@ -110,16 +154,18 @@ jobs:
           claude plugin validate --strict .claude-plugin/marketplace.json
           bash tests/run.sh
       - name: Open the sync pull request
-        if: env.NOTHING_TO_SYNC != '1'
+        if: steps.needed.outputs.run == 'true' && env.NOTHING_TO_SYNC != '1'
         working-directory: public
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          APP_SLUG: ${{ steps.app.outputs.app-slug }}
           DISPATCHER: ${{ github.actor }}
         run: |
           set -euo pipefail
           branch="sync/$VERSION"
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          user_id=$(gh api "/users/${APP_SLUG}[bot]" --jq .id)
+          git config user.name "${APP_SLUG}[bot]"
+          git config user.email "${user_id}+${APP_SLUG}[bot]@users.noreply.github.com"
           git checkout -b "$branch"
           git add -A
           git commit -q -F - <<EOF
@@ -142,7 +188,7 @@ jobs:
             echo
             echo "Validated with \`claude plugin validate --strict\` and \`tests/run.sh\` in ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}."
             echo
-            echo "After merge, cut the release here (docs/release.md)."
+            echo "Queue it when \`ci-gate\` is green. Its merge starts package-runtime, which opens the release pull request (docs/release.md, \"Syncing from development\")."
           } > "$RUNNER_TEMP/pr-body"
           gh pr create --base main --head "$branch" \
             --title "sync: $VERSION from ${PRIVATE_SHA:0:12}" --body-file "$RUNNER_TEMP/pr-body"

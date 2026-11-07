@@ -3,8 +3,11 @@
 
 Usage: follow_release.py [--dry-run]
 
-Run on a schedule by follow-private-release.yml. The private repository holds
-only a read token, so this repository follows it rather than being pushed to.
+Run by hand through follow-private-release.yml, to resume a stopped release.
+The normal path is event-driven: deliver-release.py in the private repository
+starts public-sync, the sync merge starts package-runtime, and the signed tag's
+push starts publish-release. The private repository holds only a read token
+here, so this script reads it rather than being pushed to.
 decide() is the whole policy; it starts workflows and CI, and the production environment still gates every build and publication. A person
 signs the tag, so a release stops there until the tag exists. A step that fails
 is never started again by this script: it opens one issue and waits.
@@ -192,7 +195,7 @@ def sync_issue(repository, message, version):
     if title and not any(issue["title"] == title for issue in issues):
         gh("issue", "create", "-R", repository, "--title", title, "--body",
            f"The automatic public release of {version} stopped here (docs/release.md, \"Syncing from development\"). "
-           "It continues on the next scheduled run once this is resolved.")
+           "Resolve it, then run follow-private-release by hand to continue.")
 
 
 def main(argv=None):

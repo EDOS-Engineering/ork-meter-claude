@@ -1,5 +1,5 @@
 name: package-runtime
-run-name: package-runtime ${{ inputs.plugin_version }}
+run-name: package-runtime ${{ inputs.plugin_version || 'on merge to main' }}
 
 # Builds the plugin's Go runtime from EDOS-Engineering/ork-meter for every
 # supported platform and opens a release pull request against `main`: one
@@ -8,13 +8,19 @@ run-name: package-runtime ${{ inputs.plugin_version }}
 # that pull request through the merge queue and then signs a tag
 # v<plugin_version> on the merged commit (docs/release.md, "Signed release
 # tags"). This workflow never pushes to `main` and never creates a tag.
-# Manual dispatch only: publication is a reviewed release operation and
-# never happens on push (CONTRIBUTING, condition 3). After the tag exists, the
-# publish-release workflow creates the GitHub Release with the downloadable
-# assets. Each runtime binary gets a build provenance attestation signed by
-# this workflow at build time. See docs/release.md.
+# The sync pull request's merge starts it: a push to main that makes
+# plugin.json <version>-dev. The resolve job then takes the version from
+# plugin.json and the ork-meter ref from the private release's manifest.json,
+# and does nothing for any other push, or when tag v<version> or the branch
+# package-runtime/v<version> already exists. It can also be dispatched by hand.
+# Either way the package job waits for production approval. The tag push then
+# starts publish-release, which creates the GitHub Release with the
+# downloadable assets. Each runtime binary gets a build provenance attestation
+# signed by this workflow at build time. See docs/release.md.
 
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
     inputs:
       ork_meter_ref:
@@ -29,15 +35,66 @@ on:
 permissions:
   contents: read
 
-# One release pull request at a time.
-concurrency:
-  group: package-runtime
-  cancel-in-progress: false
-
 jobs:
+  # What to build: the dispatch inputs, or, on a push, the version this push made
+  # plugin.json <version>-dev for. Cheap and ungated; every later job needs it.
+  resolve:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      run: ${{ steps.resolve.outputs.run }}
+      plugin_version: ${{ steps.resolve.outputs.plugin_version }}
+      ork_meter_ref: ${{ steps.resolve.outputs.ork_meter_ref }}
+    steps:
+      - name: Resolve the version and the ork-meter ref
+        id: resolve
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.plugin_version }}
+          INPUT_REF: ${{ inputs.ork_meter_ref }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+          GH_TOKEN: ${{ github.token }}
+          PRIVATE_TOKEN: ${{ secrets.ORK_METER_READ_TOKEN }} # read-only; see docs/release.md
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            { echo "run=true"; echo "plugin_version=$INPUT_VERSION"; echo "ork_meter_ref=$INPUT_REF"; } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          version_at() {
+            gh api "repos/$GITHUB_REPOSITORY/contents/.claude-plugin/plugin.json?ref=$1" -H "Accept: application/vnd.github.raw+json" \
+              | python3 -I -c 'import json, sys; print(json.load(sys.stdin)["version"])'
+          }
+          after=$(version_at "$AFTER")
+          before=$(version_at "$BEFORE" 2>/dev/null || echo none)
+          version=${after%-dev}
+          if [ "$after" = "$before" ] || [ "$after" = "$version" ] || ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::notice::this push left plugin.json at $after (was $before); no release to package"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          tag=$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/v$version" --jq "[.[] | select(.ref == \"refs/tags/v$version\")] | length")
+          branch=$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/heads/package-runtime/v$version" \
+            --jq "[.[] | select(.ref == \"refs/heads/package-runtime/v$version\")] | length")
+          if [ "$tag" != "0" ] || [ "$branch" != "0" ]; then
+            echo "::notice::v$version is already tagged or proposed; nothing to package"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          ref=$(GH_TOKEN="$PRIVATE_TOKEN" gh release download "v$version" -R EDOS-Engineering/claude-plugin -p manifest.json -O - \
+            | python3 -I -c 'import json, sys; print(json.load(sys.stdin)["ork_meter_ref"])')
+          [[ "$ref" =~ ^[0-9A-Za-z][0-9A-Za-z._/-]*$ ]] || { echo "::error::the private release v$version names ork_meter_ref '$ref'"; exit 1; }
+          echo "packaging $version from ork-meter $ref (plugin.json $before -> $after)"
+          { echo "run=true"; echo "plugin_version=$version"; echo "ork_meter_ref=$ref"; } >> "$GITHUB_OUTPUT"
+
   verify:
     name: verify tests and production gate
-    if: github.ref == 'refs/heads/main'
+    needs: resolve
+    if: github.ref == 'refs/heads/main' && needs.resolve.outputs.run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -70,20 +127,25 @@ jobs:
           python3 .github/scripts/check-release-gate.py "$RUNNER_TEMP/production.json" "$RUNNER_TEMP/production-branches.json"
 
   package:
-    needs: verify
-    if: github.ref == 'refs/heads/main'
+    needs: [resolve, verify]
+    if: github.ref == 'refs/heads/main' && needs.resolve.outputs.run == 'true'
+    # One release pull request at a time. On this job, not the workflow: every
+    # push to main starts a run, and a pending run in a workflow-level group is
+    # cancelled by the next one, which could drop the sync merge's run.
+    concurrency:
+      group: package-runtime
+      cancel-in-progress: false
     environment: production
-    name: package ${{ inputs.plugin_version }} from ork-meter ${{ inputs.ork_meter_ref }}
+    name: package ${{ needs.resolve.outputs.plugin_version }} from ork-meter ${{ needs.resolve.outputs.ork_meter_ref }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
-      contents: write # push the release pull request's own branch, package-runtime/v<version>; never main, never a tag
-      pull-requests: write # open the release pull request against main
+      contents: read # the App token pushes package-runtime/v<version> and opens the pull request; never main, never a tag
       id-token: write # sign the build provenance attestation of each runtime binary
       attestations: write # store that attestation on this repository
     env:
-      ORK_METER_REF: ${{ inputs.ork_meter_ref }}
-      PLUGIN_VERSION: ${{ inputs.plugin_version }}
+      ORK_METER_REF: ${{ needs.resolve.outputs.ork_meter_ref }}
+      PLUGIN_VERSION: ${{ needs.resolve.outputs.plugin_version }}
     steps:
       - name: Check out the plugin at the dispatching ref
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -94,7 +156,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: EDOS-Engineering/ork-meter
-          ref: ${{ inputs.ork_meter_ref }}
+          ref: ${{ needs.resolve.outputs.ork_meter_ref }}
           token: ${{ secrets.ORK_METER_READ_TOKEN }} # read-only token for ork-meter; see docs/release.md
           path: ork-meter
           persist-credentials: false
@@ -158,16 +220,32 @@ jobs:
           echo "$output"
           printf '%s' "$output" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert "state" in d, d'
 
+      # GitHub starts no workflow for GITHUB_TOKEN events, so the release pull
+      # request is opened with an App token, limited to this repository, for its
+      # CI to start. The release commit holds runtime/ and plugin.json only.
+      - name: Mint a token for this repository
+        id: app
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+        with:
+          app-id: ${{ vars.ORK_GITHUB_APP_ID }}
+          private-key: ${{ secrets.ORK_GITHUB_APP_PRIVATE_KEY_PEM }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-pull-requests: write
+
       - name: Open the release pull request
         env:
           DISPATCHER: ${{ github.actor }}
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.app.outputs.token }}
         run: |
           set -euo pipefail
           source_commit=$(git rev-parse HEAD)
           runtime_commit=$(git -C ork-meter rev-parse HEAD)
           branch="package-runtime/v$PLUGIN_VERSION"
           rm -rf ork-meter # never part of the release commit
+          # The release commit keeps the author check-release-commit.py requires;
+          # the App token only pushes the branch and opens the pull request.
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -b "$branch" "$source_commit"
@@ -201,7 +279,9 @@ jobs:
           git commit -q -F "$RUNNER_TEMP/commit-message"
           git show --stat --format=fuller HEAD
           # A new branch only: no force, so an existing branch is never replaced.
-          git push origin "HEAD:refs/heads/$branch"
+          # Pushed with the App token: the empty extraheader drops the checkout's
+          # GITHUB_TOKEN, which never held the App token during the build.
+          git -c http.https://github.com/.extraheader= push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:refs/heads/$branch"
           {
             echo "## What and why"
             echo
@@ -223,7 +303,7 @@ jobs:
             echo
             echo "\`git tag -s v$PLUGIN_VERSION <merged-commit> -m \"Ork Meter plugin $PLUGIN_VERSION (runtime from ork-meter $ORK_METER_REF)\"\`"
             echo
-            echo "Then dispatch the publish-release workflow from main with plugin_version $PLUGIN_VERSION to create the GitHub Release with the downloadable assets (docs/release.md, \"Publishing the GitHub Release\")."
+            echo "Pushing that tag starts publish-release, which waits for production approval and creates the GitHub Release with the downloadable assets (docs/release.md, \"Publishing the GitHub Release\")."
           } > "$RUNNER_TEMP/pr-body"
           url=$(gh pr create --base main --head "$branch" \
             --title "release: plugin $PLUGIN_VERSION with runtime from ork-meter $ORK_METER_REF" \
@@ -235,7 +315,7 @@ jobs:
             echo "- branch: \`$branch\` at $(git rev-parse HEAD)"
             echo "- plugin source: $source_commit (${GITHUB_REF_NAME})"
             echo "- runtime: ork-meter $ORK_METER_REF ($runtime_commit)"
-            echo "- next: review and merge it through the merge queue, sign a tag \`v$PLUGIN_VERSION\` on the merged commit (\`git tag -s\`), then dispatch publish-release for the GitHub Release (docs/release.md)"
+            echo "- next: review and merge it through the merge queue, then sign and push a tag \`v$PLUGIN_VERSION\` on the merged commit (\`git tag -s\`); the push starts publish-release (docs/release.md)"
             echo
             echo "| target | SHA256 |"
             echo "|---|---|"

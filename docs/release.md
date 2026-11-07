@@ -90,51 +90,79 @@ second install channel: the marketplace install above is what customers use.
 ## Syncing from development
 
 Development happens in the private repository EDOS-Engineering/claude-plugin.
-Every private release from 0.5.8 forward becomes a release here through CI.
-**follow-private-release** (`.github/workflows/follow-private-release.yml`) runs
-every 15 minutes, reads the newest private release with `ORK_METER_READ_TOKEN`
-and advances one step (`.github/scripts/follow_release.py`):
+Every private release from 0.5.8 forward becomes a release here, and each step
+starts the next by an event; nothing polls:
 
-1. It dispatches **public-sync** with `version`. That checks out the private
-   repository at `v<version>` (read-only, `persist-credentials: false`), verifies
-   the tag with main's `check-tag-signature.py` and `allowed_signers`, and runs
-   that tag's `scripts/sync_public.py`. The private manifest decides which paths
-   are mirrored, which this repository owns (LICENSE, README, SECURITY,
-   CONTRIBUTING, notices, the ruleset, this file, the release workflows, `runtime/`
-   and the marketplace pin are never touched) and which must never leave the
-   private repository; any leak pattern refuses the whole run before a write.
-   `prepare_sync.py` then sets `plugin.json` to `<version>-dev` and adds the
-   version's runtime pins. The run validates the plugin, runs `tests/run.sh`,
-   pushes `sync/<version>` and opens **sync: &lt;version&gt; from &lt;private
-   sha&gt;**. It never pushes to `main`, never tags and never publishes.
-2. It starts CI on the pull request if none started. When `ci-gate` is green it
-   opens an issue asking a person to queue it. A pull request queued with
-   `GITHUB_TOKEN` gets no `merge_group` run and jams the queue until its 30-minute
-   limit, so the workflow never queues one.
-3. It dispatches **package-runtime** with the private release's runtime ref. This
-   waits for `production` approval.
-4. It handles the release pull request the same way.
-5. It opens an issue asking a person to sign the tag `v<version>` on the merged
-   release commit, and stops until the tag exists.
-6. It dispatches **publish-release**. This waits for `production` approval.
-7. It handles the marketplace pull request the same way.
+1. The private repository's `deliver-release.py` ends, once orkmeter.com serves
+   the release it uploaded, by dispatching **public-sync** here with `version`,
+   under the operator's `gh` identity. A failed delivery starts nothing.
+2. **public-sync** does nothing if `main` already carries that version or a
+   later one (delivering an earlier release is the private rollback, and must
+   not propose a downgrade here) or if `sync/<version>` exists. Otherwise it
+   checks out the private repository at `v<version>` (read-only,
+   `persist-credentials: false`), verifies the tag with main's
+   `check-tag-signature.py` and `allowed_signers`, and runs that tag's
+   `scripts/sync_public.py`. The private manifest decides which paths are
+   mirrored, which this repository owns (LICENSE, README, SECURITY,
+   CONTRIBUTING, notices, the ruleset, this file, the release workflows,
+   `runtime/` and the marketplace pin are never touched) and which must never
+   leave the private repository; any leak pattern refuses the whole run before
+   a write. `prepare_sync.py` then sets `plugin.json` to `<version>-dev` and
+   adds the version's runtime pins. The run validates the plugin, runs
+   `tests/run.sh`, pushes `sync/<version>` and opens **sync: &lt;version&gt;
+   from &lt;private sha&gt;**. It never pushes to `main`, never tags and never
+   publishes.
+3. **A person** queues the sync pull request when `ci-gate` is green. Its merge
+   is a push to `main` that makes `plugin.json` `<version>-dev`, which starts
+   **package-runtime**. Its `resolve` job takes the ork-meter ref from the
+   private release's `manifest.json` (with `ORK_METER_READ_TOKEN`), and the
+   package job waits for `production` approval, then opens the release pull
+   request. Any other push to `main`, or a version already tagged or proposed,
+   packages nothing.
+4. **A person** queues the release pull request, then signs and pushes the tag
+   `v<version>` on the merged commit ("Cutting a release", step 10).
+5. The tag push starts **publish-release**, which dispatches itself on `main`
+   for that version (the `production` environment admits only `main`) unless
+   the Release is already published. That run waits for `production` approval,
+   publishes the GitHub Release, opens the marketplace pull request, and starts
+   ork-meter's `plugin-releases` workflow so the site's version pages pick up
+   the Release.
+6. **A person** queues the marketplace pull request.
 
-A step that fails is not started again. The run opens one issue titled
-`Release follow: ...` and waits; once the cause is fixed, re-run the failed
-workflow. The next run that gets past that state closes the issue. To run a step
-by hand, dispatch its workflow; the follower picks up from whatever it finds.
+Every pull request in this chain is opened with a GitHub App token
+(`vars.ORK_GITHUB_APP_ID`, `secrets.ORK_GITHUB_APP_PRIVATE_KEY_PEM`), limited
+to this repository and to contents and pull requests (public-sync also gets
+workflows, because `.github/workflows` is a mirrored path). GitHub starts no
+workflow for events made with `GITHUB_TOKEN`, so a pull request opened with it
+would get no CI. The token that starts `plugin-releases` is limited to
+`EDOS-Engineering/ork-meter` and to actions. Pull requests are never queued by
+a workflow: one queued with `GITHUB_TOKEN` gets no `merge_group` run and jams the
+queue until its 30-minute limit.
+
+**follow-private-release** (`.github/workflows/follow-private-release.yml`)
+runs only by hand, to resume a release that stopped. It reads the newest
+private release with `ORK_METER_READ_TOKEN` and advances one step
+(`.github/scripts/follow_release.py`): it dispatches the next workflow, starts
+CI on a generated pull request that has none, or opens one issue titled
+`Release follow: ...` when a person must act (queue a pull request, sign the
+tag, look at a failed step). A step that failed is not started again; once the
+cause is fixed, re-run the failed workflow or run the follower again. To run a
+step by hand, dispatch its workflow.
 
 ## Cutting a release
 
 Releases are cut by the `package-runtime` workflow
-(`.github/workflows/package-runtime.yml`). It runs on **manual dispatch
-only**, never on push, because publication is a reviewed operation
-(CONTRIBUTING, "Agent-authored changes", condition 3: an agent never
-builds, publishes or deploys a release). A human dispatches it, from
-`main`, after the changes it will publish have been reviewed and merged.
-The workflow never pushes to `main` and never creates a tag: it opens a
-release pull request, and a human merges it and signs a tag on the merged
-commit.
+(`.github/workflows/package-runtime.yml`). The sync pull request's merge
+starts it ("Syncing from development"), and it can be dispatched by hand from
+`main`. Either way its package job waits for `production` approval, because
+publication is a reviewed operation (CONTRIBUTING, "Agent-authored changes",
+condition 3: an agent never builds, publishes or deploys a release). On a
+push, its `resolve` job builds only when that push made `plugin.json`
+`<version>-dev` and neither tag `v<version>` nor branch
+`package-runtime/v<version>` exists; it takes `ork_meter_ref` from the
+private release's `manifest.json`. The workflow never pushes to `main` and
+never creates a tag: it opens a release pull request, and a human merges it
+and signs a tag on the merged commit.
 
 The workflow accepts dispatches only from `main`. Before building, its
 read-only verification job runs `bash tests/run.sh` and checks the existing
@@ -218,24 +246,24 @@ What the workflow does, in order:
     one signed by a key that `.github/allowed_signers` does not list for the
     tagger's email.
 
-11. **A human** dispatches the `publish-release` workflow from `main` with
-    `plugin_version`, and a required reviewer approves the `production`
-    deployment. It publishes the GitHub Release `v<version>` with the
+11. The tag push starts `publish-release`, which dispatches itself from
+    `main` with `plugin_version` (a human can also dispatch it by hand), and a
+    required reviewer approves the `production` deployment. It publishes the GitHub Release `v<version>` with the
     downloadable assets (next section), then opens the pull request
     `release: point the marketplace at v<version>` from the branch
     `release-channel/v<version>`.
-12. **follow-private-release** starts CI on that pull request if needed and asks
-    a person to queue it when `ci-gate` is green. **This is when
+12. **A human** queues that pull request when `ci-gate` is green. **This is when
     customers of this marketplace get the release.** Canary evidence and the
     platform walkthroughs ([platform-matrix.md](platform-matrix.md)) are not a
     precondition; run them when a release calls for them.
 
-`Dispatched-By` records the accountable human.
+`Dispatched-By` records the GitHub actor of the run. On a run the sync merge
+started, that is the account GitHub names for the merge's push, not
+necessarily a person; the `production` approval names the accountable human.
 
-GitHub does not start workflows for a pull request that a workflow opened
-with its own `GITHUB_TOKEN`, so `ci` does not run on the
-release pull request when it opens. Close and reopen it to run it before
-review. The merge queue runs it again on the merge group in any case.
+The release pull request is opened with the GitHub App token ("Syncing from
+development"), so `ci` starts on it by itself. The merge queue runs it again
+on the merge group.
 
 The runtime's own `--version` string is set in ork-meter's
 `cmd/claude-plugin-runtime/main.go`, independently of `plugin_version`.
@@ -430,17 +458,19 @@ Store it as the organization secret **`ORK_METER_READ_TOKEN`**, available to
 `EDOS-Engineering/claude-plugin` with it ("Syncing from development"), so its
 repository access must include that repository too, still Contents:
 Read-only.
-The token is used only by `actions/checkout` steps with
+The token is used by `actions/checkout` steps with
 `persist-credentials: false`, so it is not written into the checkout's git
-config. Set an expiry and rotate it; a missing or expired token fails the
-checkout step and nothing is published or proposed.
+config, and by `gh` (`package-runtime`'s `resolve` job and the follower) to
+read the private release's `manifest.json`. Set an expiry and rotate it; a
+missing or expired token fails that step and nothing is published or proposed.
 
-The push of `package-runtime/v<version>` and the pull request use the
-workflow's own `GITHUB_TOKEN`, with `contents: write` (for that branch) and
-`pull-requests: write` on the `package` job. Opening the pull request needs
-the repository setting "Allow GitHub Actions to create and approve pull
-requests" (Settings, Actions, General). The `GITHUB_TOKEN` never pushes to
-`main`, which the `protecc-main` ruleset protects, and never creates a tag.
+The push of `package-runtime/v<version>` and the pull request use a GitHub
+App token minted after the build and smoke test, limited to this repository
+and to contents and pull requests ("Syncing from development"); the build
+steps never hold it. The release commit is still authored as
+`github-actions[bot]`, which `check-release-commit.py` requires. The token
+never pushes to `main`, which the `protecc-main` ruleset protects, and never
+creates a tag.
 
 ### Release channel
 
@@ -566,21 +596,29 @@ conflict on that line in the queue, and the second rebases.
 The tag the marketplace points at is what customers install; the GitHub
 Release is the same release in downloadable form, for people who want to inspect a build, verify a digest, or
 install from a copy rather than a clone. The `publish-release` workflow
-(`.github/workflows/publish-release.yml`) creates it. Like `package-runtime`
-it runs on **manual dispatch only**, accepts dispatches only from `main`, runs
-the same read-only verification job (`bash tests/run.sh` and the `production`
+(`.github/workflows/publish-release.yml`) creates it. Pushing the signed tag
+starts it (a human can also dispatch it), its publication runs only on a
+dispatch from `main`, and it runs the same read-only verification job (`bash tests/run.sh` and the `production`
 environment check), and its publish job runs behind the `production`
 environment, so a required reviewer other than the dispatcher approves it.
 
-It is a separate dispatch rather than a step of `package-runtime` because the
+It is a separate workflow rather than a step of `package-runtime` because the
 release pull request that `package-runtime` opens is merged and tagged by a
-human later; nothing in that run can know the merged commit. It also cannot
-run on the tag push itself: the `production` environment allows the single
-branch `main` and no tags, and `check-release-gate.py` refuses a weaker
-policy, so a tag-triggered job could not pass the gate.
+human later; nothing in that run can know the merged commit. Its publication
+also cannot run on the tag push itself: GitHub matches the environment's
+deployment rule against the run's ref, the `production` environment allows
+the single branch `main` and no tags, and `check-release-gate.py` refuses a
+weaker policy, so a tag-triggered job could not pass the gate. The tag push's
+run therefore has one ungated `start` job, with `actions: write`: for a tag
+`v<major>.<minor>.<patch>` whose Release is not yet published, it dispatches
+`publish-release` on `main` with `plugin_version` and `requested_by` (the
+login that pushed the tag, which the Release notes and the marketplace
+commit name as the publisher). A `workflow_dispatch` made with
+`GITHUB_TOKEN` is one of the two events that still start a workflow.
 
-Dispatch input: `plugin_version`, the version whose tag `v<version>` a human
-already pushed. The publish job then:
+Dispatch inputs: `plugin_version`, the version whose tag `v<version>` a human
+already pushed, and the optional `requested_by`, which only the tag push sets.
+The publish job then:
 
 1. Checks that the tag exists, that its commit is on `main`, that the commit
    is the release commit (`release: plugin <version> with runtime from
@@ -671,10 +709,12 @@ Release on the tag that already exists, plus `id-token: write` and
 a tag (for the one way publishing could create a tag, see "Signed release
 tags"). The `point-marketplace` job that follows it pushes only the new branch
 `release-channel/v<version>` (no force) and opens the pull request against
-`main`, with `contents: write` and `pull-requests: write`; it never pushes to
-`main` and never creates a tag. GitHub does not run CI on a pull request it
-opens, so close and reopen it before review. A Release is never rewritten: if
-one is wrong, roll back or publish a new version (see "Rollback").
+`main`, with a GitHub App token limited to this repository and to contents and
+pull requests, so its CI starts by itself; it never pushes to `main` and never
+creates a tag. The `release-pages` job then starts `plugin-releases.yml` on
+`EDOS-Engineering/ork-meter` with an App token limited to that repository and
+to actions. A Release is never rewritten: if one is wrong, roll back or publish
+a new version (see "Rollback").
 
 ### SBOM
 
