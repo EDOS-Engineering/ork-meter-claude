@@ -1,17 +1,17 @@
 name: follow-private-release
 
-# Starts the public release of every new private release: the private
-# repository holds only a read token, so this repository follows it. Each run
-# advances one step (.github/scripts/follow_release.py): public-sync, then
-# package-runtime, then publish-release, starting CI on the pull requests they
-# open and opening an issue when a person must queue one. The production environment still gates each build and
-# publication, and a person still signs the tag. See docs/release.md, "Syncing
-# from development".
+# Resumes a stopped public release, by hand only. The normal path needs no run
+# of this workflow, because each step starts the next: the private
+# repository's deliver-release.py starts public-sync once orkmeter.com serves
+# the release; the sync pull request's merge starts package-runtime; the
+# signed tag's push starts publish-release. People queue the pull requests and
+# sign the tag. Each run of this one advances one step
+# (.github/scripts/follow_release.py) and opens an issue when a person must act.
+# The production environment still gates each build and publication. See
+# docs/release.md, "Syncing from development".
 
 on:
-  schedule:
-    - cron: "*/15 * * * *"
-  workflow_dispatch:
+  workflow_dispatch: # by hand only; delivery, the merges and the tag push start each step
 
 permissions:
   contents: read
