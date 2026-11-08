@@ -74,6 +74,8 @@ import features
 import hook
 import ledger
 import read_compact
+import read_notice
+import read_state
 import read_tool
 import session
 import token_gate
@@ -141,14 +143,8 @@ def read_delta(ctx, store, name, previous, response, file_info, content, digest,
     updated["file"] = dict(file_info)
     updated["file"]["content"] = diff
     updated["file"]["numLines"] = diff.count("\n") + 1
-    context = (
-        "Ork Meter delta: %s changed since its earlier full Read in this conversation (%d lines, %d bytes now). "
-        "The Read result above is not the file: it is a unified diff against that earlier Read result "
-        "(%d hunks, +%d/-%d lines). Its left-margin numbers are not file line numbers; the @@ headers are. "
-        "The complete current file is the earlier Read result with this diff applied. "
-        "Read with offset and limit for exact current lines, or set ORK_METER_DELTA=off."
-        % (file_path, content.count("\n") + 1, size, info["hunks"], info["added"], info["removed"])
-    )
+    context = read_notice.notice(read_notice.DELTA, file_path, hunks=info["hunks"], added=info["added"],
+                                 removed=info["removed"])
     after = trimmer.nbytes(diff) + trimmer.nbytes(context)
     if after >= size:
         return None
@@ -171,6 +167,11 @@ def handle(ctx):
     if not isinstance(content, str) or not isinstance(file_path, str) or not content:
         return None
     tool_input = payload.get("tool_input") if isinstance(payload.get("tool_input"), dict) else {}
+    pending = read_state.take_pending(ctx.store(), payload.get("tool_use_id"), file_path)
+    if pending is not None:
+        # The read guard sent this Read with a limit (a page) or an offset (the
+        # rest after a partial view) the model didn't ask for: say so.
+        return continued(ctx, pending, response, file_info, content, file_path)
     # Exact ranges and recovery files are intentional evidence retrieval.
     # Do not shorten them again or claim an earlier partial read was complete.
     if (read_tool.explicit_range(tool_input) or session.is_recovery_path(file_path)
@@ -185,32 +186,28 @@ def handle(ctx):
     store = ctx.store()
     agent = payload.get("agent_id")
     # Only whole-file Reads get here, so the path is the key (#190).
-    k = ledger.sha256_hex(agent) + "\x00" + file_path if isinstance(agent, str) and agent else file_path
+    k = read_state.reads_key(agent, file_path)
     previous = store.reads().get(k)
     complete = whole_file(file_info, start_line)
     # "partial": the model does not hold the whole file from this result, so a
     # repeat must be delivered in full rather than stubbed or diffed.
     entry = {"sha256": digest, "prompt_id": payload.get("prompt_id"), "ts": int(time.time()),
-             "lines": content.count("\n") + 1, "bytes": size, "partial": not complete}
+             "lines": content.count("\n") + 1, "bytes": size, "partial": not complete,
+             "total": file_info.get("totalLines")}
+    entry.update(read_state.file_stamp(file_path))
 
     if (features.enabled(env, "dedupe") and isinstance(previous, dict) and previous.get("sha256") == digest
             and not previous.get("partial") and size > MIN_DEDUPE_BYTES and same_prompt(previous, payload)):
         lines = content.split("\n")
         shown = lines[:trimmer.FIRST_LINES]
-        head = "\n".join(shown)
+        total = len(lines)
+        head = "\n".join(shown + [read_notice.marker(len(shown) + 1, total)])
         updated = dict(response)
         updated["file"] = dict(file_info)
         updated["file"]["content"] = head
-        updated["file"]["numLines"] = len(shown)
-        context = (
-            "Ork Meter: %s is unchanged since your earlier Read of it while working on this same prompt "
-            "(sha256 %s, %d lines, %d bytes). The Read result above shows only lines 1-%d; that earlier Read "
-            "result holds the full content. If it is not in your context, Read %s with offset=%d and limit=%d "
-            "for the rest (a Read with offset and limit is never shortened). Set ORK_METER_DEDUPE=off to turn "
-            "this off."
-            % (file_path, digest[:8], entry["lines"], size, len(shown), file_path, len(shown) + 1,
-               max(1, entry["lines"] - len(shown)))
-        )
+        updated["file"]["numLines"] = len(shown) + 1
+        context = read_notice.notice(read_notice.UNCHANGED, file_path, last=len(shown), total=total,
+                                     next=len(shown) + 1)
         if trimmer.nbytes(head) + trimmer.nbytes(context) >= size:
             return None
         store.update_reads(k, entry)
@@ -248,32 +245,21 @@ def handle(ctx):
 
     budget = features.trim_budget(env, "Read")
     head, info = trimmer.trim_head(content, budget, start_line)
-    if info is not None:
+    if info is not None and not info["partial_line"]:
+        # A line alone over the budget is delivered whole: a cut line is not a
+        # received line, and the emission boundary would drop it.
         # Named now, written only for an admitted reply (#130, #190).
         pending = artifacts.prepare(store, "Read", response, content)
         updated = dict(response)
         updated["file"] = dict(file_info)
-        updated["file"]["content"] = head
-        updated["file"]["numLines"] = info["lines_kept"]
+        nxt, last = info["first_elided_line"], info["last_elided_line"]
+        if isinstance(file_info.get("totalLines"), int) and nxt <= file_info["totalLines"] < last:
+            last = file_info["totalLines"]   # a final newline is not a line of its own
+        updated["file"]["content"] = head + "\n" + read_notice.marker(nxt, last)
+        updated["file"]["numLines"] = info["lines_kept"] + 1
         updated["file"]["truncatedByTokenCap"] = True
-        context = (
-            "Ork Meter trimmed this Read of %s: it shows lines %d-%d (%d bytes of %d). Lines %d-%d were not shown; "
-            "Read the file again with offset=%d (and a limit) to see them, or set ORK_METER_TRIM=off."
-            % (file_path, start_line, start_line + info["lines_kept"] - 1, info["bytes_after"], info["bytes_before"],
-               info["first_elided_line"], info["last_elided_line"], info["first_elided_line"])
-        )
-        if info["partial_line"]:
-            context = (
-                "Ork Meter trimmed this Read of %s: line %d alone exceeds the byte budget. "
-                "Only its first %d bytes are shown; the rest of that line and later lines were not shown. "
-                "Use a targeted Bash command to inspect that line, or set ORK_METER_TRIM=off for a full Read."
-                % (file_path, start_line, info["bytes_after"])
-            )
-        if info["error_lines"]:
-            context += "\nError-looking lines in the range not shown:\n" + "\n".join(info["error_lines"])
-        if note:
-            context += "\n" + note
-        context += "\nFull original Read snapshot: %s" % pending.path
+        context = read_notice.notice(read_notice.PAGE, file_path, first=start_line, last=nxt - 1, total=last,
+                                     next=nxt)
         if trimmer.nbytes(head) + trimmer.nbytes(context) < size:
             reply = hook.updated_tool_output(ctx.event, updated, context)
             # State first, admission last: the index update can wait on its
@@ -281,7 +267,7 @@ def handle(ctx):
             # returning the reply, or a late reply would leave it uncited.
             if name is not None:
                 delta.forget(store, name)   # the model saw only the head (#138)
-            store.update_reads(k, dict(entry, partial=True))
+            store.update_reads(k, dict(entry, partial=True, next=nxt))
             mark_partial(store, file_path)
             if artifacts.admit(ctx, reply, pending):
                 ctx.record(ledger.trimmed("Read", info["bytes_before"], info["bytes_after"] + trimmer.nbytes(context)))
@@ -290,6 +276,40 @@ def handle(ctx):
             # delivered-whole bookkeeping below puts the index and base back.
 
     return deliver_whole(store, k, entry, name, complete, content, file_path, env, write_guard.view_key(payload))
+
+
+def continued(ctx, pending, response, file_info, content, file_path):
+    """A Read the read guard sent with a limit (``page``) or with the offset of
+    the first line the model hadn't seen (``rest``): mark the end it still
+    leaves out and say so, and record what the model holds now."""
+    store = ctx.store()
+    payload = ctx.payload
+    start = file_info.get("startLine") if isinstance(file_info.get("startLine"), int) else 1
+    total = file_info.get("totalLines")
+    shown = content.count("\n") + 1
+    last = start + shown - 1
+    k = read_state.reads_key(payload.get("agent_id"), file_path)
+    stamp = read_state.file_stamp(file_path)
+    if not isinstance(total, int) or last >= total:
+        if pending["kind"] == "rest":
+            # The model now holds the lines before ``start`` and these: the whole file.
+            store.update_reads(k, dict(pending.get("entry") or {}, partial=False, next=None,
+                                       prompt_id=payload.get("prompt_id"), **stamp))
+            note_demand(ctx, file_path, {"offset": start})
+        return None
+    nxt = last + 1
+    store.update_reads(k, {"sha256": None, "prompt_id": payload.get("prompt_id"), "partial": True, "next": nxt,
+                           "total": total, "lines": shown, **stamp})
+    mark_partial(store, file_path)
+    updated = dict(response)
+    updated["file"] = dict(file_info)
+    updated["file"]["content"] = content + "\n" + read_notice.marker(nxt, total)
+    updated["file"]["numLines"] = shown + 1
+    if pending["kind"] == "rest":
+        context = read_notice.notice(read_notice.REST_MORE, file_path, first=start, last=last, total=total, next=nxt)
+    else:
+        context = read_notice.notice(read_notice.PAGE, file_path, first=start, last=last, total=total, next=nxt)
+    return hook.updated_tool_output(ctx.event, updated, context)
 
 
 def deliver_whole(store, k, entry, name, complete, content, file_path=None, env=None, view=None):
@@ -340,15 +360,8 @@ def compaction(ctx, store, k, entry, name, response, file_info, content, file_pa
         updated["file"]["content"] = compacted
         updated["file"]["numLines"] = len(lines)
         pending = artifacts.prepare(store, "Read", response, content)
-        context = (
-            "Ork Meter compacted this read of %s: it is a PARTIAL view. %d lines are elided, about %d tokens down "
-            "to %d: %s. Each elided range is one line '\u2026 lines A\u2013B not shown' followed by empty numbered lines "
-            "that are NOT empty in the file; every other line is exact at its own number. Before editing an elided "
-            "range, Read it with offset and limit (a plain Read of the whole file again returns nothing new). Never "
-            "rewrite this file with Write from this view (Ork Meter refuses such a Write); use Edit, and note that "
-            "Edit with replace_all also changes elided lines. Original: %s"
-            % (file_path, info["lines_elided"], info["tokens_before"], info["tokens_after"],
-               read_compact.describe(info["elided"]), pending.path))
+        context = read_notice.notice(read_notice.COMPACT, file_path, elided=info["lines_elided"],
+                                     total=content.count("\n") + 1, ranges=len(info["elided"]))
         reply = hook.updated_tool_output(ctx.event, updated, context)
         return admitted(ctx, store, k, entry, name, reply, pending,
                         ledger.read_compacted(size, trimmer.nbytes(compacted) + trimmer.nbytes(context),
@@ -361,24 +374,22 @@ def compaction(ctx, store, k, entry, name, response, file_info, content, file_pa
         return "Ork Meter compacted this Read first: %s." % over
     page_lines, outline = page
     shown = content.split("\n")[:page_lines]
-    head = "\n".join(shown)
+    total = content.count("\n") + 1
+    last = total
+    if isinstance(file_info.get("totalLines"), int) and page_lines < file_info["totalLines"] < total:
+        last = file_info["totalLines"]   # a final newline is not a line of its own
+    head = "\n".join(shown + [read_notice.marker(page_lines + 1, last)])
     updated = dict(response)
     updated["file"] = dict(file_info)
     updated["file"]["content"] = head
-    updated["file"]["numLines"] = page_lines
+    updated["file"]["numLines"] = page_lines + 1
     updated["file"]["truncatedByTokenCap"] = True
     pending = artifacts.prepare(store, "Read", response, content)
-    context = (
-        "Ork Meter read guard: %s is %d KiB and %d lines, about %d tokens; %s. This Read shows only its first "
-        "%d lines. The rest is available with further Read calls that set offset and limit, for example "
-        "offset=%d; Ork Meter refuses a Write of this file from this page until the rest is read. Set "
-        "ORK_METER_TRIM=off to turn the guard off.\nFull original Read snapshot: %s"
-        % (file_path, (size + 1023) // 1024, content.count("\n") + 1, info["tokens_before"], over, page_lines,
-           page_lines + 1, pending.path))
-    if outline:
-        context += "\n" + outline
+    # The outline is file text and the compacted size is not in a fixed notice:
+    # only the page's own notice reaches Claude.
+    context = read_notice.notice(read_notice.PAGE, file_path, first=1, last=page_lines, total=last,
+                                 next=page_lines + 1)
     reply = hook.updated_tool_output(ctx.event, updated, context)
-    total = content.count("\n") + 1
     return admitted(ctx, store, k, entry, name, reply, pending,
                     ledger.read_guarded(size, trimmer.nbytes(head) + trimmer.nbytes(context),
                                         ledger.sha256_hex(file_path)),
@@ -415,7 +426,7 @@ def admitted(ctx, store, k, entry, name, reply, pending, row, file_path=None, el
     the snapshot and returning the reply."""
     if name is not None:
         delta.forget(store, name)
-    store.update_reads(k, dict(entry, partial=True))
+    store.update_reads(k, dict(entry, partial=True, next=(min(r[0] for r in elided) if elided else None)))
     if elided:
         # The Write guard's record (hooks/lib/write_guard.py), written before
         # the reply: a view that leaves lines out is never delivered without it.

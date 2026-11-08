@@ -173,8 +173,12 @@ class Context:
 
 
 def updated_tool_output(event, updated, additional_context=None):
-    """PostToolUse: replace the tool result without adding model-facing prose."""
+    """PostToolUse: replace the tool result. ``additional_context`` reaches
+    Claude only when it is one of the fixed Read notices
+    (hooks/lib/read_notice.py); the emission boundary drops anything else."""
     out = {"hookEventName": event, "updatedToolOutput": updated}
+    if additional_context:
+        out["additionalContext"] = additional_context
     return {"hookSpecificOutput": out}
 
 

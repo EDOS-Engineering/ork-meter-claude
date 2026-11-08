@@ -4,11 +4,11 @@ A whole-file Read of a Python module over the token threshold is let
 through whole by the read guard and compacted on its result
 (hooks/dedupe-reads.py, hooks/lib/read_compact.py). At the emission
 boundary (hooks/lib/native_text.py, applied by hook.run) the compactor's
-note never reaches the model (clean_reply drops additionalContext) and the
-replaced result keeps only lines the tool returned, in order
-(source_output): the "… lines a–b not shown" markers go, and the CLI
-numbers what is left from 1. The next model request must hold that
-received-only text and nothing of the plugin's. Then, in the same session:
+fixed notice reaches the model beside the result (hooks/lib/read_notice.py)
+and the replaced result keeps the lines the tool returned plus the
+"… lines A–B not shown; Read with offset=A" markers and their empty slots,
+so the CLI numbers every shown line with its real line number. Then, in
+the same session:
 
 * an Edit of a shown line succeeds;
 * an Edit of a line the model never received, with that line's exact text,
@@ -43,6 +43,7 @@ guard's note naming the compacted size is not emitted, the ledger row is.
 """
 import json
 import os
+import re
 from pathlib import Path
 import sys
 import time
@@ -137,17 +138,24 @@ def unread_lines(host, path, session_id):
 
 
 def received_only(test, rendered, original):
-    """Every line the CLI rendered is one the tool returned, in order
-    (native_text.source_output), numbered from 1 by the CLI; returns the
-    texts, which is the content the hook emitted."""
-    lines = [line.rstrip() for line in original.split("\n")]
-    cursor = 0
+    """Every line the CLI rendered is the file's line at that number, an
+    elision marker at its own first line, or one of the marker's empty
+    slots; returns the texts, which is the content the hook emitted."""
+    lines = original.split("\n")
     texts = []
+    slots = 0
     for expected, line in enumerate(rendered, 1):
         number, text = line.split("\t", 1)
         test.assertEqual(int(number), expected, "the CLI numbers the emitted content from 1")
-        test.assertFalse(text.startswith(MARKER_PREFIX), "no marker survives the emission boundary: " + line)
-        cursor = lines.index(text, cursor) + 1   # ValueError: a line the tool never returned
+        found = re.match(r"^\u2026 lines (\d+)\u2013(\d+) not shown; Read with offset=(\d+)$", text)
+        if found:
+            test.assertEqual((int(found.group(1)), int(found.group(3))), (expected, expected), line)
+            slots = int(found.group(2)) - expected
+        elif slots and text == "":
+            slots -= 1
+        else:
+            test.assertEqual(text, lines[expected - 1], "line %d at its own number" % expected)
+            slots = 0
         texts.append(text)
     return texts
 
@@ -193,19 +201,17 @@ class NativeReadCompaction(unittest.TestCase):
 
             read = result_text(tool_results(Fixture.requests[1])["native_1"])
             delivered = json.dumps(Fixture.requests[1]["messages"][-2:])
-            # The "Ork Meter compacted this read" note (and any guard or trim note) is additionalContext:
-            # clean_reply drops it. What the model receives is the replaced result alone.
-            self.assertNotIn("Ork Meter", delivered, hook_evidence(result.stdout, Fixture.arrivals))
+            # The fixed "Ork Meter compacted this Read" notice reaches the model beside the result.
+            self.assertIn("Ork Meter compacted this Read of", delivered, hook_evidence(result.stdout, Fixture.arrivals))
             rendered = read.split("\n")
             texts = received_only(self, rendered, original)
-            # The head is delivered whole, at its own numbers; the elided bodies are not delivered. (The
-            # compactor's empty slots match the file's later blank lines in source_text, so the signatures
-            # after the first elided body, SHOWN among them, are not delivered either: observed with 2.1.311.)
+            # Every shown line is at its own number, SHOWN among them; the elided bodies are markers and slots.
             for number, line in enumerate(original.split("\n")[:40], 1):
                 self.assertEqual(rendered[number - 1], "%d\t%s" % (number, line))
+            self.assertIn("%d\t%s" % (line_number(original, SHOWN), SHOWN), rendered)
             self.assertIn("def helper_0(value):", texts)
             self.assertNotIn(ELIDED, read)
-            self.assertLess(len(rendered), total, "shorter than the file: a partial view")
+            self.assertTrue(any(text.startswith(MARKER_PREFIX) for text in texts))
             self.assertLess(len(read), len(original) // 2)
 
             outcomes = [result_text(tool_results(Fixture.requests[n])["native_%d" % n]) for n in (2, 3, 4, 5)]
@@ -223,7 +229,7 @@ class NativeReadCompaction(unittest.TestCase):
             kinds = [row["kind"] for row in rows]
             self.assertEqual(kinds, ["read_compact"], "one reducer acts on the Read, once")
             self.assertGreater(rows[0]["lines_elided"], 0)
-            # reconcile_records charges the row for the emitted text, not the compactor's view plus note.
+            # reconcile_records charges the row for the emitted text.
             self.assertIs(rows[0]["native_text_boundary_reconciled"], True)
             self.assertEqual(rows[0]["bytes_after"], len("\n".join(texts).encode("utf-8")))
             self.assertNotIn(str(target), json.dumps(rows))
@@ -278,25 +284,20 @@ class NativeReadCompaction(unittest.TestCase):
             self.assert_blocked(outcomes[0])
             self.assertIn(line_number(original, ELIDED), after_refusal, "the record held the elided lines unread")
             self.assertTrue(all(label.startswith("function ") for label in after_refusal.values()), set(after_refusal.values()))
-            # A plain whole-file re-read can't restore the elided lines, however the host answers it: with its
-            # own "file unchanged" stub, or (the stub is gone since Claude Code 2.1.317) with the content
-            # again, which the hook compacts into the same view. Either way the record still guards them.
+            # A plain whole-file re-read after the partial view is sent from the first elided line
+            # (hooks/lib/read_state.py), so the host returns the lines the model had not seen, at their
+            # real numbers, never its own "file unchanged" answer; that clears the record.
             reread_text = outcomes[1]
-            self.assertNotIn(ELIDED, reread_text, "a plain re-read does not deliver the elided lines")
-            self.assertTrue("unchanged" in reread_text.lower() or reread_text == view,
-                            "the host's unchanged stub or the same compacted view: " + reread_text[:300])
-            self.assertEqual(after_reread, after_refusal, "a plain re-read leaves the record's unread lines as they were")
-            self.assert_blocked(outcomes[2])
-            self.assertEqual(on_disk, [original], "the first refused Write left the file alone")
-            self.assertIn(ELIDED, outcomes[3], "a ranged Read returns the elided lines")
-            self.assertFalse(blocked(outcomes[4]), "every elided range read: the Write is allowed")
-            self.assertEqual(unread_lines(host, target, session_id), {}, "the ranged Read cleared the view")
-            written = rebuilt(Fixture.requests[2])["content"]
-            self.assertEqual(target.read_text(encoding="utf-8"), written)
-            self.assertLess(len(written), len(original))
-            self.assertEqual(decisions(telemetry_rows(host.scratch, "write-guard.py", "PreToolUse")),
-                             [("applied", "reply-emitted"), ("applied", "reply-emitted"), ("skipped", "handler-no-reply")],
-                             "both Writes before the ranged Read refused (a deny emitted), the last let through")
+            first_elided = min(after_refusal)
+            self.assertNotIn("unchanged", reread_text.lower())
+            self.assertTrue(reread_text.startswith("%d\t" % first_elided), reread_text[:200])
+            self.assertIn("%d\t%s" % (line_number(original, ELIDED), ELIDED), reread_text)
+            self.assertEqual(after_reread, {}, "the re-read showed every line the view left out")
+            self.assertEqual(on_disk, [original], "the refused Write left the file alone")
+            # Every line has now been shown, so the Write guard no longer refuses.
+            self.assertFalse(blocked(outcomes[2]), outcomes[2][:200])
+            self.assertEqual(decisions(telemetry_rows(host.scratch, "write-guard.py", "PreToolUse"))[:1],
+                             [("applied", "reply-emitted")], "the Write before the re-read was refused")
 
     def test_the_refused_write_leaves_the_file_unchanged(self):
         with Host(self, "ork-plugin-compact-keep-", "Read,Write", inference=Fixture) as host:
@@ -320,12 +321,15 @@ class NativeReadCompaction(unittest.TestCase):
             result = self.run_session(host, [("Read", {"file_path": str(target)})],
                                       host.env("reduce"))
             delivered = json.dumps(Fixture.requests[1]["messages"][-2:])
-            # The guard's "Ork Meter read guard" note is not emitted; its updatedInput is: the model
-            # receives the first page (48 lines, hooks/read-guard.py) at the file's own numbers.
-            self.assertNotIn("Ork Meter", delivered, hook_evidence(result.stdout, Fixture.arrivals))
+            # The guard's updatedInput pages the Read (48 lines, hooks/read-guard.py); the Read result hook
+            # ends the page with the marker at line 49 and the fixed "shortened" notice.
+            self.assertIn("Ork Meter shortened this Read of", delivered, hook_evidence(result.stdout, Fixture.arrivals))
             rendered = result_text(tool_results(Fixture.requests[1])["native_1"]).split("\n")
-            self.assertEqual(rendered, ["%d\t%s" % (number, line)
-                                        for number, line in enumerate(original.split("\n")[:48], 1)])
+            total = original.count("\n") + 1
+            self.assertEqual(rendered[:48], ["%d\t%s" % (number, line)
+                                             for number, line in enumerate(original.split("\n")[:48], 1)])
+            self.assertEqual(rendered[48], "49\t\u2026 lines 49\u2013%d not shown; Read with offset=49" % total)
+            self.assertEqual(len(rendered), 49)
             self.assertEqual([row["kind"] for row in ledger_rows(host.scratch)], ["read_guard"])
             guards = telemetry_rows(host.scratch, "read-guard.py", "PreToolUse")
             self.assertEqual([(guard["decision"], guard["reason"], guard["effects"].get("input_updated")) for guard in guards],
@@ -343,12 +347,14 @@ class NativeReadCompaction(unittest.TestCase):
                                       host.env("reduce", ORK_METER_READ_COMPACT="on", ORK_METER_READ_GUARD_BYTES="32k"))
             read = result_text(tool_results(Fixture.requests[1])["native_1"])
             delivered = json.dumps(Fixture.requests[1]["messages"][-2:])
-            # The guard's note ("compacted, it is still about N tokens") is not emitted; the page is, as the
-            # guard would page it (300 lines, each rstripped by source_text), and the read_guard row is
-            # charged for that page.
-            self.assertNotIn("Ork Meter", delivered, hook_evidence(result.stdout, Fixture.arrivals))
-            page = [line.rstrip() for line in text.split("\n")[:300]]
-            self.assertEqual(read.split("\n"), ["%d\t%s" % (number, line) for number, line in enumerate(page, 1)])
+            # The page is as the guard would page it (300 lines), then the marker at line 301 and the fixed
+            # "shortened" notice; the read_guard row is charged for what was emitted.
+            self.assertIn("Ork Meter shortened this Read of", delivered, hook_evidence(result.stdout, Fixture.arrivals))
+            # The host counts the empty line after the final newline too (totalLines 601).
+            page = text.split("\n")[:300] + ["\u2026 lines 301\u2013%d not shown; Read with offset=301"
+                                              % (text.count("\n") + 1)]
+            self.assertEqual([line.rstrip() for line in read.split("\n")],
+                             ["%d\t%s" % (number, line.rstrip()) for number, line in enumerate(page, 1)])
             self.assertNotIn("note 0300", read)
             [row] = ledger_rows(host.scratch)
             self.assertEqual(row["kind"], "read_guard")

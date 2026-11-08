@@ -314,9 +314,9 @@ class ReadSnapshotAfterGate(unittest.TestCase):
     def test_admitted_trim_cites_a_snapshot_holding_the_file_once(self):
         ctx = self.context()
         reply = self.dedupe.handle(ctx)
-        # hook.updated_tool_output drops its context arg: no note names the
-        # snapshot any more (native_text: plugin prose never reaches the model).
-        self.assertNotIn("additionalContext", reply["hookSpecificOutput"])
+        # The note is the fixed page notice (hooks/lib/read_notice.py): it names
+        # the unshown lines, not the snapshot.
+        self.assertNotIn("tool-output", reply["hookSpecificOutput"]["additionalContext"])
         self.assertLess(len(reply["hookSpecificOutput"]["updatedToolOutput"]["file"]["content"]), len(READ))
         # The snapshot is still written for the admitted reply, under the name
         # the handler derived (artifacts.prepare is pure, so it names the same file).

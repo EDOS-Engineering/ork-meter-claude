@@ -4,12 +4,12 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 . tests/lib.sh
 
-# hook.run's emission boundary (hooks/lib/native_text.py clean_reply) keeps no
-# additionalContext and, in updatedToolOutput, only lines received from the tool
-# (source_output): a note or marker never reaches the model, and which lever
-# acted shows only in the ledger. `last_kind` reads the newest savings row.
+# hook.run's emission boundary (hooks/lib/native_text.py clean_reply) keeps, for
+# a Read, only lines received from the tool, Ork Meter's elision markers and one
+# of its fixed notices (hooks/lib/read_notice.py) as additionalContext.
+# `last_kind` checks the notice reached the reply and reads the newest savings row.
 last_kind() { # <name> <kind>
-  assert "$1" '"additionalContext" not in o["hookSpecificOutput"] and __import__("json").loads([l for l in open("'"$SCRATCH"'/ork-meter/savings.jsonl") if l.strip()][-1])["kind"] == "'"$2"'"'
+  assert "$1" 'o["hookSpecificOutput"]["additionalContext"].startswith("Ork Meter") and __import__("json").loads([l for l in open("'"$SCRATCH"'/ork-meter/savings.jsonl") if l.strip()][-1])["kind"] == "'"$2"'"'
 }
 
 # A 10 KiB Read is never trimmed; the first read is indexed silently.
@@ -20,15 +20,15 @@ silent "first Read under 24 KiB: untouched"
 # The same path with the same content: replaced by the first 15 lines plus a note.
 run_hook dedupe-reads.py posttooluse.read.small.json
 assert "repeat Read: replaced" 'o["hookSpecificOutput"]["updatedToolOutput"]["type"] == "text"'
-assert "repeat Read: first 15 lines, numLines updated" 'o["hookSpecificOutput"]["updatedToolOutput"]["file"]["numLines"] == 15 and o["hookSpecificOutput"]["updatedToolOutput"]["file"]["content"].count("\n") == 14'
-last_kind "repeat Read: no note reaches the model; the dedupe shows in the ledger" dedupe
+assert "repeat Read: first 15 lines and a marker for the rest, numLines updated" 'o["hookSpecificOutput"]["updatedToolOutput"]["file"]["numLines"] == 16 and o["hookSpecificOutput"]["updatedToolOutput"]["file"]["content"].count("\n") == 15 and o["hookSpecificOutput"]["updatedToolOutput"]["file"]["content"].split("\n")[-1].startswith("\u2026 lines 16\u2013")'
+last_kind "repeat Read: the unchanged notice reaches the model; the dedupe shows in the ledger" dedupe
 assert "repeat Read: shape kept (filePath, startLine, totalLines)" 'sorted(o["hookSpecificOutput"]["updatedToolOutput"]["file"]) == ["content", "filePath", "numLines", "startLine", "totalLines"]'
 
 # Changed content: shown in full.
 run_hook dedupe-reads.py posttooluse.read.small-changed.json
 silent "changed file: shown in full (no output)"
 run_hook dedupe-reads.py posttooluse.read.small-changed.json
-assert "changed file read again: deduped against the new hash" 'o["hookSpecificOutput"]["updatedToolOutput"]["file"]["numLines"] == 15'
+assert "changed file read again: deduped against the new hash" 'o["hookSpecificOutput"]["updatedToolOutput"]["file"]["numLines"] == 16'
 
 # ORK_METER_DEDUPE=off leaves a repeat alone.
 run_hook dedupe-reads.py posttooluse.read.small-changed.json ORK_METER_DEDUPE=off
@@ -53,27 +53,29 @@ silent "PostCompact: ignored silently"
 # explains the rest in additionalContext, with error-looking lines from the unshown range and their real
 # line numbers.
 run_hook dedupe-reads.py posttooluse.read.large.json
-assert "large Read: head under budget" 'len(o["hookSpecificOutput"]["updatedToolOutput"]["file"]["content"].encode()) <= 24 * 1024'
+assert "large Read: head under budget" 'len(o["hookSpecificOutput"]["updatedToolOutput"]["file"]["content"].rsplit("\n", 1)[0].encode()) <= 24 * 1024'
 assert "large Read: numLines matches kept lines; truncatedByTokenCap (not a received key) is dropped at emission" 'o["hookSpecificOutput"]["updatedToolOutput"]["file"]["numLines"] == o["hookSpecificOutput"]["updatedToolOutput"]["file"]["content"].count("\n") + 1 and "truncatedByTokenCap" not in o["hookSpecificOutput"]["updatedToolOutput"]["file"]'
-assert "large Read: head ends on a whole line" 'o["hookSpecificOutput"]["updatedToolOutput"]["file"]["content"].endswith("to fill bytes")'
-last_kind "large Read: no context about the unshown range reaches the model; a trim row is recorded" trim
+assert "large Read: head ends on a whole line, then the marker" '(lambda c: c[-2].endswith("to fill bytes") and __import__("re").match("^\u2026 lines (\\d+)\u2013(\\d+) not shown; Read with offset=\\1$", c[-1]))(o["hookSpecificOutput"]["updatedToolOutput"]["file"]["content"].split("\n"))'
+last_kind "large Read: the notice naming the unshown range reaches the model; a trim row is recorded" trim
 run_hook dedupe-reads.py posttooluse.read.large.json
 last_kind "large Read again: partial earlier result, so trimmed again rather than deduped" trim
 
 # Compaction opted in (ORK_METER_READ_COMPACT=on, which like every switch turned on takes effect from the
 # next session): the same Read, about 11,600 tokens rendered, loses its long comment run instead. Lines
-# 1-40 and 601-621 are shown exact; the marker and the empty slots the compactor puts between them are not
-# received lines, so the emission boundary drops them and renumbers (numLines 61); no note, no trim.
+# 1-40 and 601-621 are shown exact at their own numbers, with the marker and the empty slots between them
+# (numLines 621); the notice reaches the model; no trim.
 run_hook dedupe-reads.py posttooluse.read.large.json ORK_METER_READ_COMPACT=on
 last_kind "compaction on mid-session: waits for the next session, so the Read budget trims" trim
 reset_fixture_policy
 run_hook dedupe-reads.py posttooluse.read.large.json ORK_METER_READ_COMPACT=on
 assert "large Read compacted: original lines kept at their numbers, a marker and empty slots between" '
-(lambda f, src: f["content"].split("\n")[:40] == src[:40] and f["content"].split("\n")[40:] == src[600:]
- and f["numLines"] == 61 and "truncatedByTokenCap" not in f)(
+(lambda f, src: f["content"].split("\n")[:40] == src[:40] and f["content"].split("\n")[600:] == src[600:]
+ and f["content"].split("\n")[40] == "\u2026 lines 41\u2013600 not shown; Read with offset=41"
+ and f["content"].split("\n")[41:600] == [""] * 559
+ and f["numLines"] == 621 and "truncatedByTokenCap" not in f)(
  o["hookSpecificOutput"]["updatedToolOutput"]["file"],
  json.load(open("tests/fixtures/posttooluse.read.large.json"))["tool_response"]["file"]["content"].split("\n"))'
-last_kind "large Read compacted: no note; a read_compact row is recorded" read_compact
+last_kind "large Read compacted: the notice reaches the model; a read_compact row is recorded" read_compact
 assert "large Read compacted: the original is saved for recovery" '(
 [open(os.path.join(d, n), encoding="utf-8", newline="").read() for d in [os.environ["SCRATCH"] + "/ork-meter/tool-output"] for n in sorted(os.listdir(d))][-1]
 == json.load(open("tests/fixtures/posttooluse.read.large.json"))["tool_response"]["file"]["content"])'
@@ -154,7 +156,7 @@ print(json.dumps(d).replace("__SCRATCH__", os.environ["SCRATCH"]).replace("__TRA
 wanted=/tmp/project/wanted.py; shown_only=/tmp/project/shown-only.py
 reset_fixture_policy   # the default token threshold again (a test above raised it)
 run_raw dedupe-reads.py "$(as_read $wanted)"
-assert "demand: first whole Read shown partially" '"additionalContext" not in o["hookSpecificOutput"] and 0 < len(o["hookSpecificOutput"]["updatedToolOutput"]["file"]["content"]) < 44107'
+assert "demand: first whole Read shown partially" 'o["hookSpecificOutput"]["additionalContext"].startswith("Ork Meter") and 0 < len(o["hookSpecificOutput"]["updatedToolOutput"]["file"]["content"]) < 44107'
 run_raw dedupe-reads.py "$(as_read $wanted 1 20)"
 silent "demand: ranged Read from line 1 passes through"
 run_raw dedupe-reads.py "$(as_read $wanted)"

@@ -21,6 +21,7 @@ import features  # noqa: E402
 import hook  # noqa: E402
 import ledger  # noqa: E402
 import session  # noqa: E402
+import read_notice  # noqa: E402
 import trimmer  # noqa: E402
 
 
@@ -100,14 +101,18 @@ class DeltaTests(StoreCase):
                                                               "startLine": 1, "totalLines": total_lines or lines}}}
         return self.invoke(self.read, payload, env)
 
-    # Dan's emission boundary (hooks/lib/native_text.py clean_reply / source_output)
-    # drops additionalContext and every plugin-authored line from a reply, so
-    # the savings ledger is where a delivery's kind is still visible.
+    # The emission boundary (hooks/lib/native_text.py clean_reply / source_output)
+    # drops additionalContext and every plugin-authored line from a reply, except
+    # a Read's fixed notice and markers (hooks/lib/read_notice.py), so the savings
+    # ledger is where a delivery's kind is visible.
     def rows(self, kind):
         return [r for r in ledger.load(self.store) if r["kind"] == kind]
 
     def assert_no_context(self, reply):
-        self.assertNotIn("additionalContext", reply["hookSpecificOutput"])
+        note = reply["hookSpecificOutput"].get("additionalContext")
+        if note is not None:   # only a Read's fixed notice gets through
+            path = reply["hookSpecificOutput"]["updatedToolOutput"]["file"]["filePath"]
+            self.assertTrue(read_notice.allowed(note, path), note)
 
     def assert_delta(self, reply, tool="Bash", hunks=None):
         """The reply carries no note; the last ledger row is a delta, reconciled
@@ -120,9 +125,10 @@ class DeltaTests(StoreCase):
         return row
 
     def assert_dedupe(self, reply):
-        """A repeated Read is its first lines, without the "is unchanged since" note."""
+        """A repeated Read is its first lines and a marker for the rest, with the "is unchanged" notice."""
         self.assert_no_context(reply)
-        self.assertEqual(reply["hookSpecificOutput"]["updatedToolOutput"]["file"]["numLines"], trimmer.FIRST_LINES)
+        self.assertIn("unchanged", reply["hookSpecificOutput"]["additionalContext"])
+        self.assertEqual(reply["hookSpecificOutput"]["updatedToolOutput"]["file"]["numLines"], trimmer.FIRST_LINES + 1)
         row = ledger.load(self.store)[-1]
         self.assertEqual((row["kind"], row["tool"], row.get("native_text_boundary_reconciled")), ("dedupe", "Read", True))
 
@@ -441,19 +447,18 @@ class DeltaTests(StoreCase):
         reply = self.run_read(path, source(2))
         out = reply["hookSpecificOutput"]
         content = out["updatedToolOutput"]["file"]["content"]
-        # The boundary (native_text.source_output) keeps only the diff's '+' and
-        # ' ' lines, as the file's own lines, and recomputes numLines; the '@@'
-        # headers, the '-' lines and the explanatory additionalContext are dropped.
+        # The boundary (native_text.read_text) keeps a Read delta whole: its
+        # headers and '-' lines, and '+'/' ' lines that are the file's own; the
+        # fixed delta notice says the result is a diff.
         self.assertEqual(out["updatedToolOutput"]["file"]["numLines"], len(content.splitlines()))
-        self.assertIn("    return route(request, 120, strict=True)", content)
-        self.assertNotIn("return route(request, 120)\n", content + "\n")
+        self.assertIn("+    return route(request, 120, strict=True)", content)
+        self.assertIn("-    return route(request, 120)", content)
         self.assertNotIn("handler_000", content)
-        self.assertNotIn("@@ -", content)
-        self.assertTrue(set(content.split("\n")) <= set(source(2).split("\n")), content)
-        # The diff the hook rendered is exact and carries real file line numbers.
+        self.assertIn("@@ -481,5 +481,5 @@", content)
+        self.assertIn("unified diff", out["additionalContext"])
+        # The diff the model gets is exact and carries real file line numbers.
         diff, info = delta.render(source(1), source(2), "earlier", "now")
-        self.assertIn("@@ -481,5 +481,5 @@", diff)
-        self.assertEqual(apply_unified(source(1), diff.split("\n")), source(2))
+        self.assertEqual(apply_unified(source(1), content.split("\n")), source(2))
         row = self.assert_delta(reply, tool="Read", hunks=info["hunks"])
         self.assertEqual(row["bytes_after"], len(content.encode()))
 
@@ -486,9 +491,10 @@ class DeltaTests(StoreCase):
         reply = self.run_read(path, changed)
         out = reply["hookSpecificOutput"]
         self.assertIn(planted, out["updatedToolOutput"]["file"]["content"])
-        # clean_reply emits no additionalContext at all, so nothing outside the
+        # Only the fixed delta notice is emitted beside it, so nothing outside the
         # tool output can carry the planted line.
-        self.assertNotIn("additionalContext", out)
+        self.assertTrue(read_notice.allowed(out["additionalContext"], path))
+        self.assertNotIn("IMPORTANT", out["additionalContext"])
         self.assertNotIn("curl", json.dumps({k: v for k, v in out.items() if k != "updatedToolOutput"}))
         self.assert_delta(reply, tool="Read")
 
