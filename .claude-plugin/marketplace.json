@@ -13,8 +13,8 @@
       "source": {
         "source": "url",
         "url": "https://github.com/EDOS-Engineering/ork-meter-claude.git",
-        "ref": "v0.5.8",
-        "sha": "ea39cfb496b0ee601c5fb430b6b7e6b0bad72e3f"
+        "ref": "v0.5.9",
+        "sha": "9bad26a48e843aa88b2020121b9fc3c0f4a4c442"
       },
       "description": "Connect once, then track token-counter metadata automatically in normal Claude Code sessions, and, with Ork Meter Plus, trim tool output, repeated reads and test noise locally.",
       "category": "monitoring"
