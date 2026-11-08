@@ -7,8 +7,9 @@ every line of ``content`` from ``startLine`` (``N<TAB>line``, observed with
 2.1.302). A replacement can't carry its own numbers, so an elided range
 keeps its line slots:
 
-* its first slot holds one marker, ``… lines A–B not shown (<what>; Read offset=A
-  limit=N before editing)``;
+* its first slot holds one marker, ``… lines A–B not shown; Read with offset=A``
+  (hooks/lib/read_notice.py: the one marker format the emission boundary
+  lets through, so it names no symbol from the file);
 * its other slots are empty, so every later shown line keeps its number;
 * a range that runs to the end of the file is its marker alone.
 
@@ -54,7 +55,7 @@ MIN_DATA_RUN = 12         # lines of a data literal or a run of data lines
 MIN_BODY = 8              # lines of a function or class body
 LONG_LINE = 1000          # characters: a minified or generated line
 LICENCE_SCAN = 80         # a licence header starts within these lines
-MARKER = "… lines %d–%d not shown (%s; Read offset=%d limit=%d before editing)"
+from read_notice import MARKER  # noqa: E402  "… lines A–B not shown; Read with offset=A"
 INTEREST_RE = re.compile(r"\b(?:TODO|FIXME|XXX|HACK|BUG)\b|^(?:<{7}|={7}|>{7})(?:\s|$)")
 LICENCE_RE = re.compile(r"copyright|licen[cs]e|spdx-license-identifier|all rights reserved|permission is hereby granted",
                         re.IGNORECASE)
@@ -156,7 +157,7 @@ class Costs:
 
 def marker_text(rng):
     first, last = rng.start + 1, rng.end + 1
-    return MARKER % (first, last, rng.what, first, last - first + 1)
+    return MARKER % (first, last, first)
 
 
 # --- protection ------------------------------------------------------------

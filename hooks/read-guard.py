@@ -32,6 +32,7 @@ import features
 import hook
 import ledger
 import read_compact
+import read_state
 import read_tool
 import session
 import token_gate
@@ -176,8 +177,13 @@ def guard(ctx):
     path = tool_input.get("file_path")
     if not isinstance(path, str) or not path:
         return None
-    if (session.is_recovery_path(path) or read_tool.explicit_range(tool_input)
-            or session.is_host_tool_result(path, payload.get("session_id"))):
+    if session.is_recovery_path(path) or session.is_host_tool_result(path, payload.get("session_id")):
+        return None
+    if not any(tool_input.get(field) is not None for field in ("offset", "limit", "pages")):
+        rest = recovery(ctx, tool_input, path)
+        if rest is not None:
+            return rest
+    if read_tool.explicit_range(tool_input):
         return None
     extension = os.path.splitext(path)[1].lower()
     if extension in BINARY_EXTS:
@@ -237,11 +243,31 @@ def guard(ctx):
         return None
     try:
         ctx.store().mark_partial_view(session.path_key(path))   # a later ranged Read past it is demand
+        # The Read result hook marks the page's end and says what it left out.
+        read_state.put_pending(ctx.store(), payload.get("tool_use_id"), "page", path)
     except (OSError, ValueError, TypeError):
         pass
     ctx.record(ledger.read_guarded(st.st_size, page_bytes + len(context.encode("utf-8")),
                                    ledger.sha256_hex(path)))
     return hook.updated_input(ctx.event, updated, context)
+
+
+def recovery(ctx, tool_input, path):
+    """A whole-file re-read (``allow_large`` too) of a file Ork Meter showed
+    only in part, unchanged since: sent with ``offset`` at the first line the
+    model wasn't shown. Claude Code recorded the whole file at the first Read,
+    so before 2.1.317 it would answer the same Read "file unchanged" and the
+    model would never get the rest (F016, 0.5.8)."""
+    try:
+        store = session.Store.existing_for_payload(ctx.payload, ctx.env)
+        found = store and read_state.recovery(store, ctx.payload.get("agent_id"), path)
+        if not found:
+            return None
+        nxt, entry = found
+        read_state.put_pending(store, ctx.payload.get("tool_use_id"), "rest", path, entry=entry)
+    except (OSError, ValueError, TypeError):
+        return None
+    return hook.updated_input(ctx.event, dict(tool_input, offset=nxt))
 
 
 def wanted_whole(ctx, path):

@@ -97,9 +97,10 @@ def same(got, want):
     assert json.dumps(got) == json.dumps(want), (json.dumps(got), json.dumps(want))
 same(hook.updated_tool_output("PostToolUse", {"stdout": "x"}),
      {"hookSpecificOutput": {"hookEventName": "PostToolUse", "updatedToolOutput": {"stdout": "x"}}})
-# The additional_context argument is ignored: plugin-authored context is not emitted (hook.py).
+# The note is built into the reply; clean_reply below lets only the fixed Read notices through.
 same(hook.updated_tool_output("PostToolUse", {"stdout": "x"}, "note"),
-     {"hookSpecificOutput": {"hookEventName": "PostToolUse", "updatedToolOutput": {"stdout": "x"}}})
+     {"hookSpecificOutput": {"hookEventName": "PostToolUse", "updatedToolOutput": {"stdout": "x"},
+                             "additionalContext": "note"}})
 same(hook.updated_tool_output("PostToolUse", {}, ""),
      {"hookSpecificOutput": {"hookEventName": "PostToolUse", "updatedToolOutput": {}}})
 same(hook.updated_input("PreToolUse", {"file_path": "/f", "limit": 300}, "paged"),

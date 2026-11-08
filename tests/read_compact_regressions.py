@@ -32,6 +32,7 @@ import features  # noqa: E402
 import hook_telemetry  # noqa: E402
 import ledger  # noqa: E402
 import read_compact  # noqa: E402
+import read_notice  # noqa: E402
 import session  # noqa: E402
 import token_gate  # noqa: E402
 import write_guard  # noqa: E402
@@ -93,13 +94,12 @@ class Compaction(unittest.TestCase):
         # Bodies far from the top are elided, signatures kept; the first ones stay whole.
         late = lines.index("def helper_38(value):")
         self.assertEqual(shown[late], "def helper_38(value):")
-        self.assertEqual(shown[late + 1], "… lines %d–%d not shown (function helper_38 body; "
-                                          "Read offset=%d limit=23 before editing)" % (late + 2, late + 24, late + 2))
+        self.assertEqual(shown[late + 1], "… lines %d–%d not shown; Read with offset=%d" % (late + 2, late + 24, late + 2))
+        self.assertIn((late + 2, late + 24, "function helper_38 body"), info["elided"])
         self.assertEqual(shown[late + 2:late + 24], [""] * 22)
         # The last body runs, with the blank lines after it, to the end of the file: its marker ends the result.
         last = lines.index("def helper_39(value):")
-        self.assertEqual(shown[last + 1:], ["… lines %d–%d not shown (function helper_39 body; Read offset=%d "
-                                            "limit=%d before editing)" % (last + 2, len(lines), last + 2, len(lines) - last - 1)])
+        self.assertEqual(shown[last + 1:], ["… lines %d–%d not shown; Read with offset=%d" % (last + 2, len(lines), last + 2)])
         first = lines.index("def helper_0(value):")
         self.assertEqual(shown[first:first + 24], lines[first:first + 24])
         spans = [line.split(" ")[2].split("\u2013") for line in markers(shown)]
@@ -165,10 +165,11 @@ class Compaction(unittest.TestCase):
         self.assertIsNotNone(shown)
         check_exact(self, text, shown)
         lines = text.split("\n")
-        found = " ".join(markers(shown))
-        self.assertIn("(docstring;", found)
-        self.assertIn("(comment;", found)
-        self.assertIn("(TABLE literal;", found)
+        self.assertTrue(markers(shown))
+        found = " | ".join(what for _first, _last, what in info["elided"])
+        self.assertIn("docstring", found)
+        self.assertIn("comment", found)
+        self.assertIn("TABLE literal", found)
         for kept in ('    """First line of a long docstring.', "# commentary line 0 with words", "TABLE = ["):
             self.assertEqual(shown[lines.index(kept)], kept)
         self.assertEqual(shown[-2:], ["    return 2", ""], "the end of the file stays")
@@ -177,9 +178,10 @@ class Compaction(unittest.TestCase):
         licence = "# Copyright (c) 2026 Example Ltd.\n" + "".join("# Licensed under the terms, clause %d.\n" % i
                                                                    for i in range(20))
         text = licence + python_module()
-        shown, _info = self.compact(text)
+        shown, info = self.compact(text)
         self.assertEqual(shown[0], "# Copyright (c) 2026 Example Ltd.")
-        self.assertTrue(shown[1].startswith("… lines 2–21 not shown (licence header; "))
+        self.assertEqual(shown[1], "… lines 2–21 not shown; Read with offset=2")
+        self.assertIn((2, 21, "licence header"), info["elided"])
         check_exact(self, text, shown)
 
     def test_long_lines_are_elided_whole_never_cut(self):
@@ -187,7 +189,7 @@ class Compaction(unittest.TestCase):
         shown, _info = self.compact(text, path="bundle.js", budget=2000)
         self.assertIsNotNone(shown)
         check_exact(self, text, shown)
-        self.assertTrue(shown[50].startswith("… lines 51–51 not shown (one line of 30014 characters;"))
+        self.assertEqual(shown[50], "… lines 51–51 not shown; Read with offset=51")
         self.assertEqual(shown[51:], ["tail", ""])
 
     def test_brace_language_bodies_keep_signature_and_closing_brace(self):
@@ -201,8 +203,7 @@ class Compaction(unittest.TestCase):
         lines = text.split("\n")
         last = lines.index("function work_29(a, b) {")
         self.assertEqual(shown[last], "function work_29(a, b) {")
-        self.assertTrue(shown[last + 1].startswith("… lines %d–%d not shown (definition work_29 body;"
-                                                   % (last + 2, last + 22)))
+        self.assertEqual(shown[last + 1], "… lines %d–%d not shown; Read with offset=%d" % (last + 2, last + 22, last + 2))
         self.assertEqual(shown[last + 22], "}")
 
     def test_brace_blocks_it_cannot_delimit_are_left_alone(self):
@@ -366,32 +367,43 @@ class Hooks(unittest.TestCase):
 
     def emitted(self, reply, text):
         """The ``file`` of an emitted Read reply, checked at the emission
-        boundary (native_text.clean_reply / source_output): no note, only the
-        received keys, every line one of the original's in order, numLines
-        recounted."""
+        boundary (native_text.clean_reply / source_output): one fixed notice,
+        only the received keys, numLines recounted, and every line the file's
+        line at its own number, an elision marker, or a marker's empty slot."""
         self.assertIsNotNone(reply, "a reply is emitted")
         self.assertEqual(sorted(reply), ["hookSpecificOutput"])
         out = reply["hookSpecificOutput"]
-        self.assertNotIn("additionalContext", out)
-        self.assertEqual(sorted(out), ["hookEventName", "updatedToolOutput"])
+        self.assertEqual(sorted(out), ["additionalContext", "hookEventName", "updatedToolOutput"])
         file_info = out["updatedToolOutput"]["file"]
+        self.assertTrue(read_notice.allowed(out["additionalContext"], file_info["filePath"]), out["additionalContext"])
         self.assertNotIn("truncatedByTokenCap", file_info, "not a received key: dropped by source_output")
         self.assertEqual(file_info["numLines"], len(file_info["content"].splitlines()), "recounted by source_output")
         self.assertEqual(file_info["totalLines"], text.count("\n") + 1)
-        self.assertFalse(markers(file_info["content"].split("\n")), "no plugin marker survives the boundary")
-        lines = [line.rstrip() for line in text.split("\n")]
-        cursor = 0
-        for shown in file_info["content"].split("\n"):
-            cursor = lines.index(shown, cursor) + 1   # ValueError: a line the tool never returned
+        self.assertTrue(markers(file_info["content"].split("\n")), "each elided range keeps its marker")
+        lines = text.split("\n")
+        slots = 0
+        for number, shown in enumerate(file_info["content"].split("\n"), file_info["startLine"]):
+            found = read_notice.MARKER_RE.match(shown)
+            if found:
+                self.assertEqual(int(found.group(1)), number, shown)
+                slots = int(found.group(2)) - number
+            elif slots and shown == "":
+                slots -= 1
+            else:
+                self.assertEqual(shown, lines[number - 1], "line %d at its own number" % number)
+                slots = 0
         return file_info
 
     def head(self, reply, text, kind):
         """A Read budget trim or a read guard page: the file's first lines,
-        whole, and a ledger row of ``kind``; the note that used to explain the
-        rest is not emitted."""
+        whole, then one marker for the rest, the notice saying so, and a ledger
+        row of ``kind``."""
         file_info = self.emitted(reply, text)
         shown = file_info["content"].split("\n")
-        self.assertEqual(shown, [line.rstrip() for line in text.split("\n")[:len(shown)]], "the head, whole lines")
+        self.assertEqual(shown[:-1], text.split("\n")[:len(shown) - 1], "the head, whole lines")
+        self.assertEqual(shown[-1], "\u2026 lines %d\u2013%d not shown; Read with offset=%d"
+                         % (len(shown), text.count("\n") + 1, len(shown)))
+        self.assertIn("offset=%d" % len(shown), reply["hookSpecificOutput"]["additionalContext"])
         self.assertLess(len(shown), text.count("\n") + 1)
         self.assertEqual(self.ledger()[-1]["kind"], kind)
         return file_info
@@ -441,9 +453,10 @@ class Hooks(unittest.TestCase):
         text = python_module()
         reply = self.result(text, truncatedByTokenCap=True, totalLines=5000)
         out = reply["hookSpecificOutput"]
-        self.assertNotIn("additionalContext", out)
+        self.assertTrue(read_notice.allowed(out["additionalContext"], "/work/module.py"))
         shown = out["updatedToolOutput"]["file"]["content"].split("\n")
-        self.assertEqual(shown, text.split("\n")[:len(shown)], "trimmed to its head, not compacted")
+        self.assertEqual(shown[:-1], text.split("\n")[:len(shown) - 1], "trimmed to its head, not compacted")
+        self.assertTrue(read_notice.MARKER_RE.match(shown[-1]))
         self.assertEqual([row["kind"] for row in self.ledger()], ["trim"])
 
     def test_under_the_threshold_the_read_budget_applies_as_before(self):
@@ -464,7 +477,7 @@ class Hooks(unittest.TestCase):
         # The guard's note (size, compacted size, threshold, offset=301) is not emitted; the page is, and
         # truncatedByTokenCap, which the tool did not send, is dropped by source_output.
         file_info = self.head(reply, text, "read_guard")
-        self.assertEqual(file_info["numLines"], 300)
+        self.assertEqual(file_info["numLines"], 301)   # 300 lines and the marker
         self.assertEqual([row["kind"] for row in self.ledger()], ["read_guard"])
 
     def test_no_fit_under_the_guard_threshold_is_trimmed_with_the_compacted_size(self):
@@ -479,7 +492,7 @@ class Hooks(unittest.TestCase):
         reply = self.result(text, env={"ORK_METER_READ_GUARD_TOKENS": "1000"})
         # The Python AST outline was additionalContext: it is not emitted. The guard page is, as a read_guard row.
         file_info = self.head(reply, text, "read_guard")
-        self.assertEqual(file_info["numLines"], 48)
+        self.assertEqual(file_info["numLines"], 49)   # 48 lines and the marker
         self.assertNotIn("FunctionDef", json.dumps(reply))
 
     def test_one_reply_per_read_and_a_repeat_is_compacted_again_not_stubbed(self):
@@ -589,12 +602,12 @@ class Hooks(unittest.TestCase):
         self.assertEqual(self.ledger()[-1]["kind"], "read_compact")
         return path, text, shown, self.view_ranges(path), reply
 
-    def test_no_note_reaches_the_model_the_record_and_ledger_hold_the_ranges(self):
-        # The "PARTIAL view ... Never rewrite this file with Write" note is not emitted (clean_reply drops
-        # additionalContext): the view's ranges live in the write-guard record, their size in the ledger.
+    def test_the_fixed_notice_reaches_the_model_the_record_and_ledger_hold_the_ranges(self):
+        # Only the fixed compaction notice is emitted (hooks/lib/read_notice.py): it names no symbol from
+        # the file; the view's ranges live in the write-guard record, their size in the ledger.
         path, text, shown, ranges, reply = self.compacted_file()
-        self.assertNotIn("PARTIAL", json.dumps(reply))
-        self.assertNotIn("Ork Meter", json.dumps(reply))
+        self.assertTrue(reply["hookSpecificOutput"]["additionalContext"].startswith("Ork Meter compacted this Read"))
+        self.assertNotIn("helper_", reply["hookSpecificOutput"]["additionalContext"])
         self.assertGreater(len(ranges), 1)
         labels = [label for _f, _l, label in self.record(path)["views"][write_guard.view_key({"session_id": "compact"})]]
         self.assertTrue(all(label.startswith("function helper_") for label in labels), labels)

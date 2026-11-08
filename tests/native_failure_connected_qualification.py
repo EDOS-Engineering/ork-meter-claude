@@ -89,6 +89,8 @@ SYNCED_ONTO_RUNTIME = {"0.5.7": "0.5.4"}
 RUNTIME_CANDIDATES["0.5.8-dev"] = RUNTIME_CANDIDATES["0.5.8"] = RUNTIME_CANDIDATES["0.5.7"]
 # A -dev version on main ships the last release's runtime until the next release PR replaces runtime/.
 RUNTIME_CANDIDATES["0.5.4-dev"] = RUNTIME_CANDIDATES["0.5.3"]
+RUNTIME_CANDIDATES["0.5.9"] = ("abf75c4782707f8e45341b012f2879741f79f008", {"linux-amd64": "705a835e3e0fbff83bfa523a400d19c0a823960994a6d0e52c5fecd1ccfcef32", "linux-arm64": "b08bc3a99a54ab76a72902fda6578523cafff84c92791f11aaab7b569af665ae"})
+RUNTIME_CANDIDATES["0.5.9-dev"] = RUNTIME_CANDIDATES["0.5.8"]
 _PLUGIN_VERSION = json.loads((ROOT / ".claude-plugin/plugin.json").read_text())["version"]
 RUNTIME_ORK_METER_REF, PINNED_RUNTIME_SHA256 = RUNTIME_CANDIDATES.get(
     _PLUGIN_VERSION, ("unregistered", {}))

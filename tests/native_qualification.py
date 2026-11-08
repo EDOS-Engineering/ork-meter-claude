@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+import re
 import sys
 import unittest
 
@@ -10,7 +11,7 @@ sys.path.insert(0, str(ROOT / "tests"))
 import entitled  # noqa: E402
 import host_retry  # noqa: E402
 import plus_policy_sign  # noqa: E402
-from native_host import Fixture, Host, hook_evidence, latest_tool_delivery  # noqa: E402
+from native_host import Fixture, Host, hook_evidence, latest_tool_delivery, result_text  # noqa: E402
 from native_cache_qualification import history  # noqa: E402
 sys.path.insert(0, str(ROOT / "hooks/lib"))
 import ledger  # noqa: E402
@@ -22,6 +23,17 @@ def content_only(messages):
     # Opus changes string/single-text-block containers. Keep actual content,
     # roles and tool data exact; raw wire equality is reported by the cache suite.
     return history(messages)
+
+
+def delivered_text(body):
+    """The latest tool result and the hook context after it, as the model reads them."""
+    parts = []
+    for message in latest_tool_delivery(body):
+        content = message.get("content")
+        for block in content if isinstance(content, list) else [{"text": content}]:
+            if isinstance(block, dict):
+                parts.append(result_text(block) if block.get("type") == "tool_result" else str(block.get("text", "")))
+    return "\n".join(parts)
 
 
 @unittest.skipUnless(os.environ.get("RUN_NATIVE_CLAUDE_TESTS") == "1", "opt in to installed Claude + localhost fixture")
@@ -47,6 +59,40 @@ class NativeQualification(unittest.TestCase):
 
     def test_shadow_preserves_tool_results_and_captures_received_output(self):
         self.qualify("shadow")
+
+    def test_a_cut_read_says_so_keeps_real_numbers_and_a_re_read_gets_the_rest(self):
+        """F016 (0.5.8, Claude Code 2.1.316): the Read budget kept lines 1-706 of
+        a 1,402-line file, nothing told the model, and its whole-file re-reads
+        were answered "file unchanged". Now the cut result ends in the marker at
+        its own line number, the fixed notice reaches the model beside it, and a
+        whole-file re-read is sent from the first line not shown, so the host
+        returns the rest instead of its unchanged-file answer."""
+        with Host(self, "ork-plugin-native-rest-", "Read", inference=Fixture) as host:
+            env = host.env("reduce")
+            lines = ["evidence_%04d exact source context" % i for i in range(1402)]
+            path = host.work / "fields.py"
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            Fixture.calls, Fixture.requests, Fixture.arrivals = [("Read", {"file_path": str(path)}),
+                                                                 ("Read", {"file_path": str(path)})], [], []
+            result = host.run("Read the fixture file twice.", env=env, system="Use the requested local files.")
+            host.assert_no_external_traffic()
+            self.assertEqual(len(Fixture.requests), 3)
+            first = delivered_text(Fixture.requests[1])
+            found = re.search(r"\n(\d+)\t\u2026 lines (\d+)\u2013(\d+) not shown; Read with offset=(\d+)", first)
+            self.assertIsNotNone(found, hook_evidence(result.stdout))
+            number, start, end, offset = (int(value) for value in found.groups())
+            self.assertEqual((number, offset), (start, start), "the marker sits at its own line number")
+            self.assertIn(end, (1402, 1403))
+            self.assertIn("\n%d\tevidence_%04d exact source context" % (start - 1, start - 2), first)
+            self.assertNotIn("evidence_%04d" % (start - 1), first)
+            self.assertIn("Ork Meter shortened this Read of %s: it shows lines 1\u2013%d" % (path, start - 1), first,
+                          "the notice reaches the model")
+            second = delivered_text(Fixture.requests[2])
+            self.assertNotIn("unchanged", second.lower())
+            self.assertIn("%d\tevidence_%04d exact source context" % (start, start - 1), second)
+            self.assertIn("1402\tevidence_1401 exact source context", second)
+            [store] = host.stores().values()
+            self.assertEqual([row["kind"] for row in ledger.load(store)], ["trim"])
 
     def qualify(self, mode, mutate_defaults=False, ast_file=False, ast_lines=350):
         with Host(self, "ork-plugin-native-", "Read", inference=Fixture) as host:
@@ -108,13 +154,15 @@ class NativeQualification(unittest.TestCase):
                     else:
                         self.assertIn("distant", delivered)
             elif mode == "reduce":
-                # dedupe-reads' "Ork Meter trimmed this Read" note and the snapshot path are
-                # dropped at the boundary: the model gets the exact head lines, the full text
-                # is in the session's tool-output snapshot and the ledger holds the trim row.
+                # The model gets the exact head lines, the marker for the rest and the fixed
+                # "shortened" notice (no snapshot path); the full text is in the session's
+                # tool-output snapshot and the ledger holds the trim row.
                 delivered = json.dumps(first)
                 self.assertNotIn("evidence_0499", delivered, hook_evidence(result.stdout))
                 self.assertIn("evidence_0000 exact source context", delivered)
-                self.assertNotIn("Ork Meter", delivered)
+                self.assertIn("Ork Meter shortened this Read of", delivered)
+                self.assertIn("not shown; Read with offset=", delivered)
+                self.assertNotIn("tool-output", delivered)
                 [store] = host.stores().values()
                 # One snapshot per trimmed Read: the second, unranged Read is trimmed too
                 # under the pinned 1 KiB budget (mutate_defaults); the ranged one is not.
@@ -138,10 +186,10 @@ class NativeQualification(unittest.TestCase):
                 for item in post:
                     self.assertIn("evidence_0499", json.dumps(item["tool_response"]))
             if mutate_defaults:
-                # Still trimmed under the pinned 1 KiB budget: the head only, no note.
+                # Still trimmed under the pinned 1 KiB budget: the head, a marker and the notice.
                 self.assertNotIn("evidence_0499", json.dumps(second))
                 self.assertIn("evidence_0000 exact source context", json.dumps(second))
-                self.assertNotIn("Ork Meter", json.dumps(second))
+                self.assertIn("Ork Meter shortened this Read of", json.dumps(second))
                 pins = list(temporary_files.rglob(session.POLICY_NAME))
                 self.assertEqual(len(pins), 1)
                 pin = json.loads(pins[0].read_text())

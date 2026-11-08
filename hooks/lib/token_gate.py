@@ -247,10 +247,36 @@ def permits(before, after, context=""):
 _last_verdict = None
 
 
+def marks_only(payload, out):
+    """The reply only marks where a Read the read guard limited ends, and says
+    so (dedupe-reads.continued): the received content plus one elision marker
+    line, and a fixed notice. The saving was made before the Read ran, so it
+    is admitted although it is longer than what it replaces."""
+    import read_notice
+    before, after = payload.get("tool_response"), out.get("updatedToolOutput")
+    if payload.get("tool_name") != "Read" or not isinstance(before, dict) or not isinstance(after, dict):
+        return False
+    old, new = before.get("file"), after.get("file")
+    if not isinstance(old, dict) or not isinstance(new, dict) or not isinstance(old.get("content"), str):
+        return False
+    content = new.get("content")
+    if not isinstance(content, str) or not content.startswith(old["content"] + "\n"):
+        return False
+    tail = content[len(old["content"]) + 1:]
+    others = {key: value for key, value in new.items() if key not in ("content", "numLines")}
+    return (bool(read_notice.MARKER_RE.match(tail)) and "\n" not in tail
+            and others == {key: value for key, value in old.items() if key not in ("content", "numLines")}
+            and {key: value for key, value in after.items() if key != "file"}
+            == {key: value for key, value in before.items() if key != "file"}
+            and read_notice.allowed(out.get("additionalContext"), old.get("filePath")))
+
+
 def permits_reply(payload, reply):
     global _last_verdict
     out = reply.get("hookSpecificOutput", {}) if isinstance(reply, dict) else {}
     if "updatedToolOutput" not in out:
+        return True
+    if marks_only(payload, out):
         return True
     before = payload.get("tool_response")
     try:

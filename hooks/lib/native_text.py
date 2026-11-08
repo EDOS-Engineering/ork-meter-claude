@@ -1,13 +1,82 @@
 """Remove plugin-authored prose at the native hook emission boundary.
 
 Lossy reductions remain lossy. Only received source lines (or a verified JSON
-whitespace-only minification) survive a replacement; no explanations are added.
+whitespace-only minification) survive a replacement, with one exception: a
+Read result may carry Ork Meter's fixed elision markers and one fixed notice
+(hooks/lib/read_notice.py), so a Read that leaves lines out says so, and a
+Read delta its diff headers and removed lines.
 """
 from bisect import bisect_left
 import re
 
 ANSI = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]')
 CAPPED = re.compile(r'(?:…|â€¦) \[\+\d+ chars\]$')
+
+
+DIFF_OLD = re.compile(r'^--- .* \(earlier Read, sha256 [0-9a-f]{8}\)$')
+DIFF_NEW = re.compile(r'^\+\+\+ .* \(now, sha256 [0-9a-f]{8}\)$')
+DIFF_HUNK = re.compile(r'^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@$')
+
+
+def read_text(original, candidate, first_line, total=None):
+    """A Read result's ``content``: received lines in order, plus Ork Meter's
+    elision markers (read_notice.MARKER_RE) for ranges of received lines
+    still ahead, each followed by at most as many empty slots as the lines
+    it stands for. A unified diff against an earlier Read (the delta lever)
+    keeps its headers and removed lines; its context and added lines must be
+    received lines. A marker may stand for lines past the received ones, up
+    to ``total`` (the file's line count), as at the end of a limited Read."""
+    import read_notice
+    if not isinstance(original, str) or not isinstance(candidate, str):
+        return source_text(original, candidate)
+    lines = original.split('\n')
+    candidate_lines = candidate.split('\n')
+    if len(candidate_lines) > 1 and DIFF_OLD.match(candidate_lines[0]) and DIFF_NEW.match(candidate_lines[1]):
+        return _read_diff(lines, candidate_lines)
+    last_line = first_line + len(lines) - 1
+    if isinstance(total, int) and not isinstance(total, bool):
+        last_line = max(last_line, total)
+    result = []
+    cursor = 0
+    index = 0
+    while index < len(candidate_lines):
+        line = candidate_lines[index]
+        index += 1
+        found = read_notice.MARKER_RE.match(line)
+        if found:
+            first, last, offset = (int(value) for value in found.groups())
+            if (offset == first and first <= last and first - first_line >= cursor
+                    and last <= last_line):
+                result.append(line)
+                slots = last - first
+                while slots and index < len(candidate_lines) and candidate_lines[index] == '':
+                    result.append('')
+                    index += 1
+                    slots -= 1
+                cursor = last - first_line + 1
+            continue
+        for position in range(cursor, len(lines)):
+            if lines[position] == line:
+                result.append(line)
+                cursor = position + 1
+                break
+    return '\n'.join(result)
+
+
+def _read_diff(lines, candidate_lines):
+    result = candidate_lines[:2]
+    cursor = 0
+    for line in candidate_lines[2:]:
+        if DIFF_HUNK.match(line) or (line.startswith('-') and not line.startswith('---')):
+            result.append(line)
+            continue
+        if line[:1] in ('+', ' '):
+            for position in range(cursor, len(lines)):
+                if lines[position] == line[1:]:
+                    result.append(line)
+                    cursor = position + 1
+                    break
+    return '\n'.join(result)
 
 
 def source_text(original, candidate):
@@ -61,7 +130,10 @@ def source_output(original, candidate):
             if key not in original:
                 updated.pop(key, None)
                 continue
-            if isinstance(value, str):
+            if key == 'content' and isinstance(value, str) and isinstance(original.get('startLine'), int) \
+                    and isinstance(original.get('filePath'), str):
+                updated[key] = read_text(original.get(key, ''), value, original['startLine'], original.get('totalLines'))
+            elif isinstance(value, str):
                 updated[key] = source_text(original.get(key, ''), value)
             elif isinstance(value, dict) and isinstance(original.get(key), dict):
                 updated[key] = source_output(original[key], value)
@@ -78,6 +150,18 @@ def source_output(original, candidate):
     return candidate if type(original) is type(candidate) else original
 
 
+def read_notice_allowed(payload, note):
+    """``note`` is one of Ork Meter's fixed Read notices for this Read's file
+    (hooks/lib/read_notice.py), beside a replaced Read result."""
+    if payload.get('tool_name') != 'Read' or payload.get('hook_event_name') != 'PostToolUse':
+        return False
+    response = payload.get('tool_response')
+    path = response.get('file', {}).get('filePath') if isinstance(response, dict) and \
+        isinstance(response.get('file'), dict) else None
+    import read_notice
+    return read_notice.allowed(note, path)
+
+
 def clean_reply(payload, reply):
     if not isinstance(reply, dict):
         return None
@@ -85,10 +169,13 @@ def clean_reply(payload, reply):
              if key in {'hookSpecificOutput', 'continue', 'suppressOutput', 'decision'}}
     specific = clean.get('hookSpecificOutput')
     if isinstance(specific, dict):
+        note = specific.get('additionalContext')
         specific = {key: value for key, value in specific.items()
                     if key in {'hookEventName', 'updatedToolOutput', 'updatedInput', 'permissionDecision'}}
         if 'updatedToolOutput' in specific:
             specific['updatedToolOutput'] = source_output(payload.get('tool_response'), specific['updatedToolOutput'])
+            if read_notice_allowed(payload, note):
+                specific['additionalContext'] = note
         if set(specific) <= {'hookEventName'}:
             clean.pop('hookSpecificOutput', None)
         else:

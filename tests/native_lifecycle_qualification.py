@@ -30,45 +30,56 @@ import ledger  # noqa: E402
 import session  # noqa: E402
 import trimmer  # noqa: E402
 
-# hooks/lib/native_text.py clean_reply drops additionalContext at the emission
-# boundary, so no "Ork Meter ..." note (dedupe, delta, trim) reaches the model;
-# the transcript holds only received file lines, and the ledger the kind.
+# The emission boundary (hooks/lib/native_text.py) lets through, for a Read,
+# only received file lines, Ork Meter's elision markers and one fixed notice
+# (hooks/lib/read_notice.py), which the CLI delivers after the tool result.
 NOTE = "Ork Meter"
 
 
 def assert_delivered_without_notes(test, body, identifier):
-    """The tool result reached the model with no plugin-authored text after it."""
+    """A result delivered whole: no plugin-authored text after it."""
     test.assertNotIn(NOTE, text_after(body, identifier))
     test.assertNotIn("Full original Read snapshot", text_after(body, identifier))
     return result_text(tool_results(body)[identifier])
 
 
+def assert_delivered_with_notice(test, body, identifier, notice):
+    """The tool result reached the model with a fixed notice starting
+    ``notice`` after it, and no snapshot path."""
+    after = text_after(body, identifier)
+    test.assertIn(notice, after)
+    test.assertNotIn("Full original Read snapshot", after)
+    return result_text(tool_results(body)[identifier])
+
+
 def assert_dedupe_delivery(test, body, identifier, tag):
-    """A repeated identical Read is its first trimmer.FIRST_LINES lines and
-    nothing else (hooks/dedupe-reads.py; the "is unchanged since" note is gone)."""
-    visible = assert_delivered_without_notes(test, body, identifier)
+    """A repeated identical Read is its first trimmer.FIRST_LINES lines, a
+    marker for the rest at its own line number and the "unchanged" notice."""
+    visible = assert_delivered_with_notice(test, body, identifier, "Ork Meter: ")
     test.assertIn("%s_line_%04d" % (tag, trimmer.FIRST_LINES - 1), visible, tag)
+    test.assertIn("%d\t\u2026 lines %d\u2013" % (trimmer.FIRST_LINES + 1, trimmer.FIRST_LINES + 1), visible, tag)
     test.assertNotIn("%s_line_%04d" % (tag, trimmer.FIRST_LINES), visible, tag)
     test.assertNotIn(tag + "_line_0119", visible, tag)
+    test.assertIn("unchanged", text_after(body, identifier))
 
 
 def assert_delta_delivery(test, body, identifier, tag, marker):
-    """A changed re-read is the diff's received lines only: the changed line
-    and its context, no '@@' header, no removed line, no "Ork Meter delta:"
-    note (native_text.source_output keeps '+' and ' ' lines as file lines)."""
-    visible = assert_delivered_without_notes(test, body, identifier)
-    test.assertIn("%s_line_0060 %s " % (tag, marker), visible, tag)
-    test.assertNotIn("@@ -", visible, tag)
+    """A changed re-read is the unified diff, headers and removed line kept,
+    with the "Ork Meter delta:" notice."""
+    visible = assert_delivered_with_notice(test, body, identifier, "Ork Meter delta: ")
+    test.assertIn("+%s_line_0060 %s " % (tag, marker), visible, tag)
+    test.assertIn("@@ -", visible, tag)
     test.assertNotIn(tag + "_line_0000", visible, tag + " must not be delivered whole")
     test.assertNotIn(tag + "_line_0119", visible, tag + " must not be delivered whole")
 
 
 def assert_trim_delivery(test, body, identifier, tag, last):
-    """A trimmed Read is its head: the first line, not the last, and no
-    "Ork Meter trimmed this Read" note."""
-    visible = assert_delivered_without_notes(test, body, identifier)
+    """A trimmed Read is its head, then the marker for the rest at its own
+    line number, with the "shortened" notice."""
+    visible = assert_delivered_with_notice(test, body, identifier, "Ork Meter shortened this Read of ")
     test.assertIn(tag + "_line_0000", visible, tag)
     test.assertNotIn("%s_line_%04d" % (tag, last), visible, tag + " must be trimmed")
+    test.assertRegex(visible, r"\n(\d+)\t\u2026 lines \1\u2013\d+ not shown; Read with offset=\1$")
 
 
 def lines(tag, count=120):

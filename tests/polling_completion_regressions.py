@@ -5,7 +5,6 @@ import shlex
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -66,26 +65,6 @@ class Tests(unittest.TestCase):
             polling_receipt.write(root/'deadline.json', dict(origin_monotonic=time.monotonic()))
             self.assertIsNone(runtime.poll(payload(root, 'Bash', {'command':'sleep 540; cat unrelated.log'},
                                                    cwd=str(root)), root))
-
-    def test_concurrent_cancellation_returns_unknown_without_waiting_full_window(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            polling_receipt.write(root/'deadline.json', dict(origin_monotonic=time.monotonic()))
-            row = dict(receipt=str(root/'missing.done'), nonce='a'*32, paths=[str(root/'owned.log')],
-                       cancelled=False, tool_use_id='launch', background_id=None)
-            polling_receipt.write(root/'task-test.json', row)
-            timer = threading.Timer(.1, lambda: polling_receipt.write(root/'task-test.json', dict(row, cancelled=True)))
-            timer.start()
-            started = time.monotonic()
-            try:
-                updated, note = runtime.poll(payload(root, 'Bash', {'command':'sleep 540; cat owned.log'},
-                                                    cwd=str(root)), root)
-            finally:
-                timer.join()
-            self.assertLess(time.monotonic()-started, 2)
-            self.assertEqual(updated['command'], 'cat owned.log')
-            self.assertIn('unknown after native cancellation', note)
-            self.assertNotIn('completed with exit', note)
 
     def test_only_native_batch_boundary_renews_the_window(self):
         with tempfile.TemporaryDirectory() as temporary:

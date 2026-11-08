@@ -213,7 +213,10 @@ class Regressions(unittest.TestCase):
                 self.assertEqual(info["lines_kept"], 1)
                 self.assertEqual(info["first_elided_line"], 7)
 
-    def test_long_read_reply_describes_partial_line_and_never_dedupes_it(self):
+    def test_a_single_line_over_the_read_budget_is_delivered_whole(self):
+        # A line cut inside is not a received line: the emission boundary
+        # (native_text.read_text) would drop it and deliver an empty file. Claude
+        # Code shortens a long line in its own rendering, so the Read passes.
         module = load("hooks/dedupe-reads.py")
         payload = {"session_id": "long-read", "tool_name": "Read", "scratchpad_dir": str(self.root),
                    "tool_input": {"file_path": "large.txt"}, "tool_response": {
@@ -221,15 +224,8 @@ class Regressions(unittest.TestCase):
                                                  "numLines": 1, "startLine": 1, "totalLines": 1}}}
         for _ in range(2):
             ctx = context(payload)
-            reply = module.handle(ctx)["hookSpecificOutput"]
-            file = reply["updatedToolOutput"]["file"]
-            self.assertLessEqual(trimmer.nbytes(file["content"]), 24576)
-            self.assertEqual(file["numLines"], 1)
-            self.assertTrue(file["truncatedByTokenCap"])   # the handler's reply; hook.run's boundary drops the key
-            # The "rest of that line" note is gone: hook.updated_tool_output carries no additionalContext.
-            self.assertNotIn("additionalContext", reply)
-        # Both deliveries are trims of the partial line, never a dedupe stub ("unchanged").
-        self.assertEqual([row["kind"] for row in ledger.load(ctx.store())], ["trim", "trim"])
+            self.assertIsNone(module.handle(ctx))
+        self.assertEqual([row["kind"] for row in ledger.load(ctx.store())], [])
 
     def test_fallback_store_survives_late_scratchpad_and_lookup(self):
         sid = "late-scratchpad"

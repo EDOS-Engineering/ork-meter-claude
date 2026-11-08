@@ -188,10 +188,9 @@ class OutputRecovery(unittest.TestCase):
 
         self.assertIsNone(read("prompt-1"))
         stub = read("prompt-1")
-        self.assertEqual(stub["hookSpecificOutput"]["updatedToolOutput"]["file"]["numLines"], 15)
-        # The "Read %s with offset=16 and limit=386" note is gone: hook.updated_tool_output carries no
-        # additionalContext (and hook.run's boundary would drop it); the stub shows as a dedupe ledger row.
-        self.assertNotIn("additionalContext", stub["hookSpecificOutput"])
+        # 15 lines and the marker for the rest; the fixed notice says how to get it back.
+        self.assertEqual(stub["hookSpecificOutput"]["updatedToolOutput"]["file"]["numLines"], 16)
+        self.assertIn("offset=16", stub["hookSpecificOutput"]["additionalContext"])
         self.assertEqual([row["kind"] for row in ledger.load(self.store)], ["dedupe"])
         # The suggested range passes through in full.
         self.assertIsNone(read("prompt-1", {"file_path": path, "offset": 16, "limit": 386}))
