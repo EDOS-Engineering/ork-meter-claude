@@ -450,7 +450,7 @@ def status_line(env):
     session-start line asks the person to connect)."""
     state = getattr(env, "entitlement", None)
     if state == entitlement.NOT_ENTITLED:
-        return entitlement.MESSAGE
+        return entitlement.message(env)
     if state == entitlement.NOT_CONNECTED:
         return None
     if mode(env) == "shadow":

@@ -54,6 +54,63 @@ for state in connected pending failed partial; do
     check "$state: one JSON object with systemMessage only" bash -c 'printf "%s" "$1" | node -e "const v=JSON.parse(require(\"fs\").readFileSync(0,\"utf8\"));if(Object.keys(v).length!==1||typeof v.systemMessage!==\"string\")process.exit(1)"' _ "$output"
   fi
 done
+
+# The configured origin (ORK_METER_PLUGIN_ORIGIN in managed or user settings;
+# tests/project_env_regressions.py covers where it is read from) goes to the
+# runtime, and the runtime's line saying nothing is sent because of it is the
+# one runtime line that is shown.
+origin_fixture="$tmp/origin plugin"
+mkdir -p "$origin_fixture/hooks" "$origin_fixture/scripts"
+cp "$source_hook" "$origin_fixture/hooks/session-start.sh"
+cat > "$origin_fixture/hooks/py.sh" <<'SCRIPT'
+#!/usr/bin/env bash
+[ "$1" = --script ] && [ "$2" = scripts/pairing.py ] && [ "$3" = configured-origin ] || exit 9
+[ -z "${TEST_PY_FAILS:-}" ] || exit 1
+[ -z "${TEST_CONFIGURED_ORIGIN:-}" ] || printf '%s\n' "$TEST_CONFIGURED_ORIGIN"
+SCRIPT
+cat > "$origin_fixture/scripts/runtime.sh" <<'SCRIPT'
+#!/usr/bin/env bash
+printf '%s\n' "$*" > "$TEST_RUNTIME_ARGS"
+case "${TEST_RUNTIME_STATE:-}" in
+  mismatch) printf '%s\n' '{"systemMessage":"Ork Meter: this computer is connected to https://orkmeter.com but is configured for https://ome.example-customer.com. Nothing is being sent. Run /ork-meter:disconnect, then /ork-meter:connect to connect to https://ome.example-customer.com."}' ;;
+  unusable) printf '%s\n' '{"systemMessage":"Ork Meter: the configured destination is not an exact https origin, or could not be read, so nothing is being sent. Ask your administrator to check ORK_METER_PLUGIN_ORIGIN."}' ;;
+  lapsed) printf '%s\n' '{"systemMessage":"Ork Meter: there is no current deployment attestation for https://ome.example-customer.com, so nothing is being sent. It is fetched again automatically; if this stays, ask your administrator whether that deployment is still in service."}' ;;
+  expiring) printf '%s\n' '{"systemMessage":"Ork Meter: this connection expires in 3 days."}' ;;
+esac
+exit 0
+SCRIPT
+export TEST_RUNTIME_ARGS="$tmp/runtime-args"
+origin_data="$tmp/origin data"
+mkdir -p "$origin_data"
+start_with_origin() { # [VAR=value ...]: runs the hook; sets $output and $args
+  rm -f "$TEST_RUNTIME_ARGS"
+  output=$(env "$@" bash "$origin_fixture/hooks/session-start.sh" "$origin_data" < tests/fixtures/session-start.startup.json)
+  args=$(cat "$TEST_RUNTIME_ARGS" 2>/dev/null)
+}
+start_with_origin
+expect "nothing configured: the runtime is told nothing" "$args" "--if-installed session-start"
+start_with_origin TEST_CONFIGURED_ORIGIN=https://ome.example-customer.com
+expect "a configured origin goes to the runtime" "$args" "--if-installed session-start --configured-origin https://ome.example-customer.com"
+expect "and a session with no conflict stays silent" "$output" ""
+start_with_origin TEST_PY_FAILS=1
+expect "the setting could not be determined and none was in force: nothing is said" "$args" "--if-installed session-start"
+: > "$origin_data/configured-origin"
+start_with_origin TEST_PY_FAILS=1
+expect "the setting could not be determined and one was in force: the runtime is told so, not told there is none" "$args" "--if-installed session-start --configured-origin unreadable"
+rm -f "$origin_data/configured-origin"
+for state in mismatch unusable lapsed; do
+  start_with_origin TEST_RUNTIME_STATE="$state" TEST_CONFIGURED_ORIGIN=https://ome.example-customer.com
+  case "$output" in
+    '{"systemMessage":"Ork Meter: '*'othing is being sent'*'"}') echo "  ok   $state: the runtime's line is shown" ;;
+    *) echo "  FAIL $state: the runtime's line is not shown: '${output:0:160}'"; fails=$((fails + 1)) ;;
+  esac
+  if command -v node >/dev/null 2>&1; then
+    check "$state: one JSON object with systemMessage only" bash -c 'printf "%s" "$1" | node -e "const v=JSON.parse(require(\"fs\").readFileSync(0,\"utf8\"));if(Object.keys(v).length!==1||typeof v.systemMessage!==\"string\")process.exit(1)"' _ "$output"
+  fi
+done
+start_with_origin TEST_RUNTIME_STATE=expiring
+expect "every other runtime notice is still not printed" "$output" ""
+
 rm "$fixture/scripts/runtime.sh"
 output=$(bash "$fixture/hooks/session-start.sh" < /dev/null)
 expect "missing runtime stays non-blocking: the warning, no command hint" "$output" "$unavailable"
@@ -191,14 +248,24 @@ check "a broken package starts no background install" test ! -e "$data/runtime/.
 expect "a broken package is never copied" "$(copies)" 0
 
 # First-run connect: until connected, the first session that can show a
-# browser starts `runtime.sh connect` detached, says so in one line and
-# records the attempt; afterwards a nudge at most once a day; never once
+# browser starts `runtime.sh connect` detached, says so in one line once
+# connect answers that it opened the page, and records the attempt; afterwards a nudge at most once a day; never once
 # connected; only the nudge where no browser can open; nothing with
 # ORK_METER_AUTO_CONNECT=off.
 unset ORK_METER_AUTO_CONNECT
 first="$tmp/first run"
 mkdir -p "$first/hooks" "$first/scripts"
 cp "$source_hook" "$first/hooks/session-start.sh"
+# The configured origin, as scripts/pairing.py configured-origin prints it:
+# the contents of $tmp/configured-origin, none when it is absent; a failure
+# (settings unreadable) while $tmp/configured-origin-fails exists.
+cat > "$first/hooks/py.sh" <<SCRIPT
+#!/usr/bin/env bash
+[ ! -e "$tmp/configured-origin-fails" ] || exit 1
+[ ! -e "$tmp/configured-origin" ] || cat "$tmp/configured-origin"
+SCRIPT
+# How the stub connect answers ($tmp/connect.mode): opened (default), refused,
+# slow (opened, after 4 s, longer than the hook waits).
 # Detached children get a scrubbed environment, so the paths are baked in.
 cat > "$first/scripts/runtime.sh" <<SCRIPT
 #!/usr/bin/env bash
@@ -212,7 +279,13 @@ case "\$1" in
     esac ;;
   --plugin-data)
     case "\$3" in
-      connect) printf '%s\n' "\$*" >> "$tmp/connect.log"; env > "$tmp/connect.env"; pwd > "$tmp/connect.pwd"; sleep 3 ;;
+      connect)
+        printf '%s\n' "\$*" >> "$tmp/connect.log"; env > "$tmp/connect.env"; pwd > "$tmp/connect.pwd"
+        case "\$(cat "$tmp/connect.mode" 2>/dev/null)" in
+          refused) printf '%s\n' '{"error":"origin_conflict","message":"refused"}'; exit 1 ;;
+          slow) sleep 4 ;;
+        esac
+        printf '%s\n' '{"destination":"https://orkmeter.com","message":"m","state":"setup_opened"}' ;;
       --install) printf '%s\n' "\$2" >> "$tmp/install.log" ;;
     esac ;;
 esac
@@ -245,10 +318,14 @@ wait_launches() { # <count>
 
 data="$tmp/first data"
 started=$(now)
-output=$(desktop ANTHROPIC_API_KEY=sk-session-secret CLAUDE_CONFIG_DIR="$tmp/claude config" HOME="$tmp/home" first_hook "$data")
+output=$(desktop ANTHROPIC_API_KEY=sk-session-secret CLAUDE_CONFIG_DIR="$tmp/claude config" HOME="$tmp/home" \
+  SSL_CERT_FILE="$tmp/ca.pem" SSL_CERT_DIR="$tmp/certs" ORK_METER_VAULT_DIR="$tmp/vault" first_hook "$data")
 elapsed=$(python3 -c "print(round($(now) - $started, 2))")
 expect "first run: one line saying the setup page is opening" "$output" "$opened"
-check "first run: the hook did not wait for connect (${elapsed} s, under 1.5 s)" python3 -c "import sys; sys.exit(0 if $elapsed < 1.5 else 1)"
+# The stub answers at once, so the hook must not sit out its 2.5 s wait
+# (Windows runners take about 1.8 s for the whole hook).
+check "first run: the hook waited only for connect's answer (${elapsed} s, under 2.5 s)" python3 -c "import sys; sys.exit(0 if $elapsed < 2.5 else 1)"
+check "first run: the answer is read and removed" test ! -e "$data/first-run-connect-answer"
 check "first run: connect started in the background" wait_launches 1
 expect "first run: the production connect, with this data dir" "$(head -1 "$tmp/connect.log")" "--plugin-data $data connect --environment production"
 expect "first run: the attempt is recorded" "$(cut -d ' ' -f 1 "$data/first-run-connect")" opened
@@ -256,6 +333,9 @@ check "connect gets the desktop, home and Claude config but no session secret, c
   ! grep -q sk-session-secret "$1" && ! grep -q "^ANTHROPIC_" "$1" && grep -qx "DISPLAY=:99" "$1" \
     && grep -qx "HOME=$2/home" "$1" && grep -qx "CLAUDE_CONFIG_DIR=$2/claude config" "$1" && [ "$(cat "$3")" = / ]' \
   _ "$tmp/connect.env" "$tmp" "$tmp/connect.pwd"
+check "connect keeps the TLS trust and vault settings" bash -c '
+  grep -qx "SSL_CERT_FILE=$2/ca.pem" "$1" && grep -qx "SSL_CERT_DIR=$2/certs" "$1" && grep -qx "ORK_METER_VAULT_DIR=$2/vault" "$1"' \
+  _ "$tmp/connect.env" "$tmp"
 expect "second session the same day: silent" "$(desktop first_hook "$data")" ""
 expect "second session: connect not started again" "$(launches)" 1
 printf '%s\n' "$(( $(date +%s) - 90000 ))" > "$data/first-run-connect-nudge"
@@ -315,6 +395,49 @@ case "$(uname -s)-$(uname -r)" in
     expect "Linux without a display: no connect" "$(launches)" 0
     expect "Linux with Wayland: opening" "$(desktop -u DISPLAY WAYLAND_DISPLAY=wayland-0 first_hook "$data")" "$opened" ;;
 esac
+
+# A configured origin: connect starts there, never at production.
+: > "$tmp/connect.log"
+printf '%s\n' https://ome.example-customer.com > "$tmp/configured-origin"
+data="$tmp/first configured"
+expect "configured origin: opening once connect opened the page" "$(desktop first_hook "$data")" "$opened"
+check "configured origin: connect started" wait_launches 1
+expect "configured origin: connect goes to that origin" "$(head -1 "$tmp/connect.log")" "--plugin-data $data connect --origin https://ome.example-customer.com"
+
+# Refused (no current attestation, say): no page, so no line saying one opens.
+: > "$tmp/connect.log"
+printf refused > "$tmp/connect.mode"
+data="$tmp/first refused"
+expect "connect refused: no opening line" "$(desktop first_hook "$data")" ""
+check "connect refused: it was started" wait_launches 1
+expect "connect refused: the attempt is recorded" "$(cut -d ' ' -f 1 "$data/first-run-connect")" opened
+check "connect refused: the answer is removed" test ! -e "$data/first-run-connect-answer"
+rm -f "$tmp/configured-origin"
+
+# Slower than the hook waits: the page still opens, without the line, and the
+# hook stays well inside its 5 s limit.
+: > "$tmp/connect.log"
+printf slow > "$tmp/connect.mode"
+data="$tmp/first slow"
+started=$(now)
+output=$(desktop first_hook "$data")
+elapsed=$(python3 -c "print(round($(now) - $started, 2))")
+expect "slow connect: no opening line" "$output" ""
+# Its 2.5 s wait plus the hook's own work (about 1.1 s on Windows runners),
+# inside Claude Code's 5 s hook limit.
+check "slow connect: the hook gave up waiting (${elapsed} s, under 4.5 s)" python3 -c "import sys; sys.exit(0 if $elapsed < 4.5 else 1)"
+check "slow connect: started" wait_launches 1
+rm -f "$tmp/connect.mode"
+
+# An unreadable configured origin: connect would be refused, so it is not started.
+: > "$tmp/connect.log"
+data="$tmp/first unreadable"
+mkdir -p "$data"; : > "$data/configured-origin"
+: > "$tmp/configured-origin-fails"
+expect "unreadable configured origin (runtime cold): silent" "$(desktop first_hook "$data" cold)" ""
+sleep 0.3
+expect "unreadable configured origin: no connect" "$(launches)" 0
+rm -f "$tmp/configured-origin-fails"
 
 : > "$tmp/connect.log"
 data="$tmp/first concurrent"

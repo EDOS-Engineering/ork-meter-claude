@@ -5,7 +5,8 @@ ci.yml's ``changes`` job calls, on merge_group only,
     python3 .github/scripts/ci_reuse.py
 
 with GH_TOKEN, GITHUB_REPOSITORY, EVENT, HEAD_REF, HEAD_SHA and BASE_SHA (the
-merge_group event's head_ref, head_sha and base_sha) in the environment. It
+merge_group event's head_ref, head_sha and base_sha) in the environment, and
+BUMP (``true`` when ci_bump.py said this merge group is a version bump alone). It
 writes ``reuse`` (``true``/``false``) and ``run`` (the reused run's URL, or
 empty) to $GITHUB_OUTPUT, and the decision to $GITHUB_STEP_SUMMARY.
 
@@ -24,7 +25,9 @@ It answers ``true`` only when every one of these holds:
    completed with conclusion success and comes from this repository, and
    every job of its latest attempt succeeded: ci-gate and at least one leg of
    each heavy job, none skipped (a docs-only or fork run skipped some) but
-   wsl, which runs only on nightly and dispatched runs.
+   wsl, which runs only on nightly and dispatched runs. When BUMP is ``true``
+   the PR run skipped unit and native-host for the same reason this run does,
+   so those two may be skipped; the connected suite must still have passed.
 
 Anything else, including an API error, missing or unexpected data, more than
 one run, or a run that is queued, in progress (a re-run) or did not succeed,
@@ -45,6 +48,8 @@ GATE_JOB = "ci-gate"
 HEAVY_JOB_PREFIXES = ("unit (", "native-host (", "connected failure modes")
 # A job pull requests skip by design; if one ran, it must still have passed.
 NIGHTLY_JOB_PREFIXES = ("wsl (",)
+# The jobs a version bump alone skips (ci_bump.py); the same rule as above.
+BUMP_SKIPPED_PREFIXES = ("unit (", "native-host (")
 HEAD_REF_RE = re.compile(r"^(?:refs/heads/)?gh-readonly-queue/(?P<base>.+)/pr-(?P<number>[1-9][0-9]*)-[0-9a-f]{40}$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
@@ -78,9 +83,10 @@ def _tree(api, repo, sha):
     return _sha(_get(api("repos/%s/commits/%s" % (repo, sha)), "commit", "tree", "sha"), "tree of " + sha)
 
 
-def check(api, repo, event, head_ref, head_sha, base_sha):
+def check(api, repo, event, head_ref, head_sha, base_sha, bump=False):
     """The reused run's URL, or raise Refuse. ``api(path)`` returns parsed JSON
-    for a GitHub REST path and raises on any error."""
+    for a GitHub REST path and raises on any error. ``bump`` says this merge
+    group is a version bump alone, so its PR run skipped unit and native-host."""
     if event != "merge_group":
         raise Refuse("event is %r, not merge_group" % event)
     if not isinstance(repo, str) or not re.match(r"^[\w.-]+/[\w.-]+$", repo):
@@ -146,22 +152,23 @@ def check(api, repo, event, head_ref, head_sha, base_sha):
     for job in job_list:
         name = _get(job, "name")
         conclusion = _get(job, "conclusion")
-        nightly_only = isinstance(name, str) and name.startswith(NIGHTLY_JOB_PREFIXES)
-        if _get(job, "status") != "completed" or (conclusion != "success" and not (nightly_only and conclusion == "skipped")):
+        may_skip = isinstance(name, str) and name.startswith(
+            NIGHTLY_JOB_PREFIXES + (BUMP_SKIPPED_PREFIXES if bump is True else ()))
+        if _get(job, "status") != "completed" or (conclusion != "success" and not (may_skip and conclusion == "skipped")):
             raise Refuse("run %s job %r is %s/%s" % (url, name, _get(job, "status"), _get(job, "conclusion")))
         names.append(name)
     if GATE_JOB not in names:
         raise Refuse("run %s has no %s job" % (url, GATE_JOB))
     for prefix in HEAVY_JOB_PREFIXES:
-        if not any(isinstance(name, str) and name.startswith(prefix) for name in names):
+        if not any(isinstance(name, str) and name.startswith(prefix) for name in names):  # a skipped matrix keeps its name
             raise Refuse("run %s ran no %r job" % (url, prefix))
     return url
 
 
-def decide(api, repo, event, head_ref, head_sha, base_sha):
+def decide(api, repo, event, head_ref, head_sha, base_sha, bump=False):
     """(reuse, run URL or "", reason). Never raises: any doubt runs in full."""
     try:
-        url = check(api, repo, event, head_ref, head_sha, base_sha)
+        url = check(api, repo, event, head_ref, head_sha, base_sha, bump)
     except Refuse as refusal:
         return False, "", str(refusal)
     except Exception as error:  # noqa: BLE001 - fail open to full testing
@@ -183,7 +190,7 @@ def main(environ=None, api=gh_api):
     environ = os.environ if environ is None else environ
     reuse, url, reason = decide(api, environ.get("GITHUB_REPOSITORY", ""), environ.get("EVENT", ""),
                                 environ.get("HEAD_REF", ""), environ.get("HEAD_SHA", ""),
-                                environ.get("BASE_SHA", ""))
+                                environ.get("BASE_SHA", ""), environ.get("BUMP", "") == "true")
     verdict = "reuse=%s: %s" % ("true" if reuse else "false", reason)
     print(verdict + ("\nreused run: " + url if url else ""))
     summary = environ.get("GITHUB_STEP_SUMMARY")

@@ -451,6 +451,56 @@ def _discover(env, payload, extra=None):
     return blocks, fallback
 
 
+# The origin this computer is configured to connect to (an Ork Meter
+# Enterprise deployment, say). Not ORK_METER_ORIGIN, which is the platform's
+# own deploy variable.
+ORIGIN = "ORK_METER_PLUGIN_ORIGIN"
+# Returned in place of a setting that is present but cannot be used. It is not
+# an origin, so the runtime records a conflict and nothing is sent until the
+# setting is corrected: a rule that cannot be read is not a rule that was lifted.
+ORIGIN_UNREADABLE = "unreadable"
+
+
+def configured_origin(env, payload=None):
+    """The origin an administrator (managed settings) or the person (user
+    settings) configured for this computer, as written; None when neither
+    names one. Managed settings win, and among them the last drop-in.
+
+    Only those files are read. The process environment is never consulted,
+    because a project's settings merge into it and a hook cannot tell where a
+    value came from: a repository must not be able to choose where usage is
+    sent, nor to lift an administrator's choice. A project's own value is
+    therefore neither used nor reported here.
+
+    A managed file that exists but cannot be read, and a value that is not
+    text, give ``ORIGIN_UNREADABLE``. The person's own unreadable settings
+    file counts as naming nothing: they could remove the setting anyway.
+    Whether the value is an acceptable origin is the runtime's decision
+    (``session-start --configured-origin``). Never raises."""
+    try:
+        key = _key(ORIGIN)
+        managed = None
+        for path in managed_files():
+            block = env_block(path)
+            if block is None:
+                managed = ORIGIN_UNREADABLE
+            elif key in block:
+                managed = block[key] if isinstance(block[key], str) and block[key] else ORIGIN_UNREADABLE
+        if managed is not None:
+            return managed
+        # The home directory may itself come from a project's settings.
+        found = _discover(env, payload)
+        home_vars = {_key(v) for v in HOME_VARS}
+        distrust_home = found is not None and any(block is None or home_vars & set(block) for _, block in found[0])
+        user = user_settings_path(env, distrust_home)
+        block = env_block(user) if user else None
+        if not block or key not in block:
+            return None
+        return block[key] if isinstance(block[key], str) and block[key] else ORIGIN_UNREADABLE
+    except Exception:
+        return ORIGIN_UNREADABLE
+
+
 def project_names(env, payload=None):
     """The environment names any of this session's project settings files
     sets (the files ``trusted`` reads), as compared by the environment, so a

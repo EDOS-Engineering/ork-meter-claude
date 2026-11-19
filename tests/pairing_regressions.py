@@ -101,6 +101,11 @@ class Pairing(unittest.TestCase):
                                           "NO_PROXY": "", "no_proxy": ""})
         proxies.start()
         self.addCleanup(proxies.stop)
+        # The developer's own managed or user settings never decide a test.
+        self.configured = None
+        origin = patch.object(self.pairing.project_env, "configured_origin", lambda env, payload=None: self.configured)
+        origin.start()
+        self.addCleanup(origin.stop)
 
     def run_script(self, *argv):
         out = []
@@ -121,9 +126,70 @@ class Pairing(unittest.TestCase):
             code, answer = self.run_script("connect", "--environment", "production")
         self.assertEqual(code, 0)
         command = run.call_args.args[0]
-        self.assertEqual(command[:2], ["bash", str(ROOT / "scripts/runtime.sh")])
+        self.assertEqual(command[:2], [self.pairing.bash_path(), str(ROOT / "scripts/runtime.sh")])
         self.assertEqual(command[2:], ["--plugin-data", str(self.data), "connect", "--environment", "production"])
         return answer
+
+    # --- where a new pairing starts, and what starts it ------------------------
+
+    def test_a_configured_origin_is_where_connect_starts(self):
+        self.configured = "https://ome.example-customer.com"
+        with self.runtime_answer({"state": "setup_started"}) as run:
+            code, _ = self.run_script("connect")
+        self.assertEqual(code, 0)
+        self.assertEqual(run.call_args.args[0][2:],
+                         ["--plugin-data", str(self.data), "connect", "--origin", "https://ome.example-customer.com"])
+
+    def test_a_configured_origin_refuses_another_environment_before_the_runtime_starts(self):
+        self.configured = "https://ome.example-customer.com"
+        with self.runtime_answer({"state": "setup_started"}) as run:
+            code, answer = self.run_script("connect", "--environment", "dev")
+        self.assertEqual((code, answer["state"]), (1, "origin_conflict"))
+        self.assertIn("https://ome.example-customer.com", answer["message"])
+        run.assert_not_called()
+
+    def test_a_setting_that_cannot_be_read_goes_to_the_runtime_which_refuses_it(self):
+        # The runtime decides what an acceptable origin is; this script never falls back to production.
+        self.configured = self.pairing.project_env.ORIGIN_UNREADABLE
+        with self.runtime_answer("", returncode=2) as run:
+            self.pairing.main(["--plugin-data", str(self.data), "connect"])
+        self.assertEqual(run.call_args.args[0][-2:], ["--origin", "unreadable"])
+
+    def test_configured_origin_prints_the_value_or_nothing(self):
+        for configured, expected in ((None, ""), ("https://ome.example-customer.com", "https://ome.example-customer.com\n")):
+            self.configured = configured
+            out = []
+            with patch.object(self.pairing.sys, "stdout") as stdout:
+                stdout.write.side_effect = out.append
+                self.assertEqual(self.pairing.main(["configured-origin"]), 0)
+            self.assertEqual("".join(out), expected)
+
+    def test_bash_is_started_by_absolute_path_and_never_from_the_working_directory(self):
+        # Started by bare name, Windows looks in the working directory first: the project's (#404).
+        with tempfile.TemporaryDirectory() as temporary:
+            planted = Path(temporary) / "repo"
+            trusted = Path(temporary) / "bin"
+            planted.mkdir()
+            trusted.mkdir()
+            name = "bash.exe" if os.name == "nt" else "bash"
+            for directory in (planted, trusted):
+                (directory / name).write_text("#!/bin/sh\nexit 0\n")
+                (directory / name).chmod(0o755)
+            before = os.getcwd()
+            os.chdir(planted)
+            try:
+                for path in ("", ".", os.pathsep.join(["", ".", "repo"])):
+                    with self.subTest(path=path), patch.dict(os.environ, {"PATH": path}):
+                        found = self.pairing.bash_path()
+                        self.assertTrue(os.path.isabs(found), found)
+                        self.assertNotEqual(Path(found).resolve().parent, planted.resolve())
+                with patch.dict(os.environ, {"PATH": os.pathsep.join(["", ".", str(trusted)])}):
+                    self.assertEqual(Path(self.pairing.bash_path()), trusted / name)
+            finally:
+                os.chdir(before)
+        with self.runtime_answer({"state": "setup_started"}) as run:
+            self.run_script("connect")
+        self.assertTrue(os.path.isabs(run.call_args.args[0][0]))
 
     # --- connect -------------------------------------------------------------
 
