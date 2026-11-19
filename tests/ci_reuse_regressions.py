@@ -167,6 +167,56 @@ class Decide(unittest.TestCase):
         self.assertTrue(reused)
         self.assertEqual(url, RUN_URL)
 
+    def skipped(self, *prefixes):
+        """responses() with the PR run's jobs of these prefixes collapsed to a
+        skipped matrix, named as Actions names one it never expanded."""
+        placeholder = {"unit (": "unit (${{ matrix.os }})",
+                       "native-host (": "native-host (${{ matrix.os }}, claude ${{ matrix.claude }})",
+                       "connected failure modes": "connected failure modes (linux)"}
+
+        def change(d):
+            jobs = d[jobs_key()]
+            kept = [j for j in jobs["jobs"] if not j["name"].startswith(prefixes)]
+            kept += [{"name": placeholder[prefix], "status": "completed", "conclusion": "skipped"} for prefix in prefixes]
+            jobs["jobs"], jobs["total_count"] = kept, len(kept)
+        return edit(change)
+
+    def bump(self, data, flag=True):
+        return reuse.decide(FakeAPI(data), REPO, "merge_group", HEAD_REF, GROUP, BASE, flag)
+
+    def test_a_version_bump_reuses_a_run_that_skipped_unit_and_native_host(self):
+        data = self.skipped("unit (", "native-host (")
+        reused, url, _ = self.bump(data)
+        self.assertTrue(reused)
+        self.assertEqual(url, RUN_URL)
+        self.assertTrue(self.bump(responses())[0], "a bump whose PR run ran everything is reusable too")
+
+    def test_only_a_version_bump_may_have_skipped_them(self):
+        data = self.skipped("unit (", "native-host (")
+        self.assertFull(decide(data))
+        for flag in (False, None, "true", 1):
+            with self.subTest(flag=flag):
+                self.assertFull(self.bump(data, flag))
+
+    def test_a_version_bump_still_needs_the_connected_suite_and_passing_jobs(self):
+        self.assertFull(self.bump(self.skipped("unit (", "native-host (", "connected failure modes")))
+        for name in ("unit (ubuntu-latest)", "native-host (ubuntu-latest, claude latest)",
+                     "connected failure modes (linux)", "ci-gate", "release channel"):
+            for conclusion in ("failure", "cancelled", None):
+                with self.subTest(job=name, conclusion=conclusion):
+                    def change(d, name=name, conclusion=conclusion):
+                        for job in d[jobs_key()]["jobs"]:
+                            if job["name"] == name:
+                                job["conclusion"] = conclusion
+                    self.assertFull(self.bump(edit(change)))
+        for name in ("ci-gate", "release channel", "runtime provenance", "changes"):
+            with self.subTest(skipped=name):
+                def skip(d, name=name):
+                    for job in d[jobs_key()]["jobs"]:
+                        if job["name"] == name:
+                            job["conclusion"] = "skipped"
+                self.assertFull(self.bump(edit(skip)))
+
     def test_api_error_runs_in_full(self):
         for key in responses():
             with self.subTest(key=key):
@@ -234,6 +284,18 @@ class Main(unittest.TestCase):
         output, summary = self.run_main(self.ENV, FakeAPI(responses()))
         self.assertEqual(output, "reuse=true\nrun=%s\n" % RUN_URL)
         self.assertIn("Reused run: " + RUN_URL, summary)
+
+    def test_bump_comes_from_the_environment_and_only_true_counts(self):
+        def skip(d):
+            for job in d[jobs_key()]["jobs"]:
+                if job["name"].startswith(reuse.BUMP_SKIPPED_PREFIXES):
+                    job["conclusion"] = "skipped"
+        data = edit(skip)
+        self.assertEqual(self.run_main(dict(self.ENV, BUMP="true"), FakeAPI(data))[0], "reuse=true\nrun=%s\n" % RUN_URL)
+        for value in ("false", "", "True", "1"):
+            with self.subTest(BUMP=value):
+                self.assertEqual(self.run_main(dict(self.ENV, BUMP=value), FakeAPI(data))[0], "reuse=false\nrun=\n")
+        self.assertEqual(self.run_main(self.ENV, FakeAPI(data))[0], "reuse=false\nrun=\n")
 
     def test_refusal_writes_false(self):
         output, summary = self.run_main(dict(self.ENV, EVENT="pull_request"), FakeAPI(responses()))

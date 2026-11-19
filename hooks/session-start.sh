@@ -27,7 +27,10 @@ cat >/dev/null 2>&1 || true
 # Starts `scripts/runtime.sh <args>` detached, as described above: a double
 # fork, its own session, HUP, INT and TERM ignored, stdio off the hook's pipes,
 # cwd /, and an environment of PATH plus the variables named in $keep_names.
+# With $detached_answer set, the runtime's stdout goes to that file, written
+# when the runtime exits (through a .part file, so a reader never sees half).
 keep_names=(PATH TMPDIR TEMP TMP SYSTEMROOT WINDIR ORK_DEV_RUNTIME)
+detached_answer=
 run_detached() { # <runtime.sh args...>
   local runner=() keep=() name
   case "${OSTYPE:-}" in
@@ -48,8 +51,11 @@ run_detached() { # <runtime.sh args...>
       case "$2" in /* | [A-Za-z]:[\\/]*) cd / 2>/dev/null || true ;; esac
       # bash -c closes stdout first thing, as runtime.sh --install does: the
       # signal, read below, that setsid has already run.
-      env -i "${keep[@]}" "${runner[@]}" bash -c 'exec >/dev/null 2>&1 </dev/null; exec bash "$@"' bash \
-        "$root/scripts/runtime.sh" "$@" </dev/null 2>/dev/null &
+      env -i "${keep[@]}" "${runner[@]}" bash -c 'exec >/dev/null 2>&1 </dev/null
+        answer=$1; shift
+        [ -n "$answer" ] || exec bash "$@"
+        umask 077; bash "$@" > "$answer.part"; mv -f "$answer.part" "$answer"' bash \
+        "$detached_answer" "$root/scripts/runtime.sh" "$@" </dev/null 2>/dev/null &
     ) </dev/null 2>/dev/null
   }
   # With setsid, the child's stdout is a pipe read here until it closes it,
@@ -66,9 +72,11 @@ install_in_background() { run_detached --plugin-data "$1" --install; }
 
 # First-run connect. Until this Claude configuration is connected, the first
 # session that can show a browser starts what /ork-meter:connect starts: the
-# runtime's local setup page (plan, telemetry consent, sign-in, approval), and
-# says so in one line. Opening the page is not consent: the runtime sends
-# nothing but the platform's anonymous readiness check (GET /auth/config)
+# runtime's local setup page (plan, telemetry consent, sign-in, approval) at
+# the configured origin if there is one, else production, and says so in one
+# line once connect answers that it opened the page. Opening the page is not
+# consent: the runtime sends nothing but the platform's anonymous readiness
+# check (GET /auth/config), and for a configured origin its attestation,
 # before the person approves there, and Claude's settings change only on
 # approval. The attempt is recorded in $data/first-run-connect so it happens
 # once. After that, or where no browser can open (CI, `claude -p`, SSH without
@@ -79,6 +87,12 @@ install_in_background() { run_detached --plugin-data "$1" --install; }
 nudge_interval=86400
 attempt_marker() { printf '%s/first-run-connect' "$CLAUDE_PLUGIN_DATA"; }
 nudge_marker() { printf '%s/first-run-connect-nudge' "$CLAUDE_PLUGIN_DATA"; }
+answer_file() { printf '%s/first-run-connect-answer' "$CLAUDE_PLUGIN_DATA"; }
+# How long, in tenths of a second, the first session waits for connect's
+# answer. The line saying the page is opening is printed only once connect
+# says it opened one ("setup_opened"); a slower connect still opens the page,
+# without the line. The hook's own limit is 5 s.
+answer_wait=25
 auto_connect_off() {
   case "$(printf '%s' "${ORK_METER_AUTO_CONNECT:-}" | tr '[:upper:]' '[:lower:]')" in
     off | 0 | false | no) return 0 ;;
@@ -101,25 +115,47 @@ can_open_browser() {
     *) return 1 ;;
   esac
 }
+# $1: the configured origin (ORK_METER_PLUGIN_ORIGIN), or empty. A configured
+# origin is where a new pairing starts, as for /ork-meter:connect
+# (scripts/pairing.py destination); the runtime verifies its attestation
+# before it opens anything.
 start_connect() {
-  local name
+  local name selector=(--environment production)
+  [ -z "$1" ] || selector=(--origin "$1")
   # connect needs the person's desktop and credential store, and Claude's
   # config directory; never the session's API keys, tokens or settings.
   keep_names=(PATH HOME USER LOGNAME LANG TMPDIR TEMP TMP SYSTEMROOT WINDIR USERPROFILE APPDATA LOCALAPPDATA
     PROGRAMDATA COMSPEC PATHEXT DISPLAY WAYLAND_DISPLAY XAUTHORITY BROWSER DBUS_SESSION_BUS_ADDRESS
     XDG_RUNTIME_DIR XDG_CONFIG_HOME XDG_DATA_HOME XDG_DATA_DIRS XDG_STATE_HOME XDG_CURRENT_DESKTOP
     WSL_DISTRO_NAME WSL_INTEROP CLAUDE_CONFIG_DIR ORK_DEV_RUNTIME
-    HTTPS_PROXY HTTP_PROXY NO_PROXY https_proxy http_proxy no_proxy)
+    HTTPS_PROXY HTTP_PROXY NO_PROXY https_proxy http_proxy no_proxy
+    SSL_CERT_FILE SSL_CERT_DIR ORK_METER_VAULT_DIR)
   for name in $(compgen -e); do
     case "$name" in LC_*) keep_names+=("$name") ;; esac
   done
-  run_detached --plugin-data "$CLAUDE_PLUGIN_DATA" connect --environment production
+  detached_answer=$(answer_file)
+  run_detached --plugin-data "$CLAUDE_PLUGIN_DATA" connect "${selector[@]}"
+}
+# 0 when connect answered, within $answer_wait, that it opened the setup page.
+# The answer is read once and removed.
+page_opened() {
+  local answer i opened=1
+  answer=$(answer_file)
+  for ((i = 0; i < answer_wait; i++)); do
+    [ -e "$answer" ] && break
+    sleep 0.1
+  done
+  [ -e "$answer" ] || return 1
+  grep -q '"state": *"setup_opened"' "$answer" 2>/dev/null && opened=0
+  rm -f "$answer" 2>/dev/null
+  return "$opened"
 }
 now_epoch() { date +%s 2>/dev/null; }
 # Prints the session's one line, or nothing. $1: 1 when this Claude
-# configuration is connected.
+# configuration is connected. $2: the configured origin, empty when none, or
+# "unreadable" (then nothing is started: connect would be refused).
 first_run_connect() {
-  local connected=$1 marker nudge now last=
+  local connected=$1 configured=${2:-} marker nudge now last=
   ! auto_connect_off || return 0
   case "${CLAUDE_PLUGIN_DATA:-}" in /* | [A-Za-z]:[\\/]*) ;; *) return 0 ;; esac
   marker=$(attempt_marker) nudge=$(nudge_marker)
@@ -131,12 +167,16 @@ first_run_connect() {
     return 0
   fi
   [ "$(head -c 9 "$marker" 2>/dev/null)" != connected ] || return 0
+  [ "$configured" != unreadable ] || return 0
   if [ ! -e "$marker" ] && can_open_browser; then
     # noclobber creates the record exclusively: of concurrent first
     # sessions, one opens the page.
     if (umask 077 && mkdir -p "$CLAUDE_PLUGIN_DATA" && set -C && printf 'opened %s\n' "$now" > "$marker") 2>/dev/null; then
-      if start_connect >/dev/null 2>&1; then
+      if start_connect "$configured" >/dev/null 2>&1; then
         (umask 077 && printf '%s\n' "$now" > "$nudge") 2>/dev/null
+        # Only when a page opened: a configured origin without a current
+        # attestation, or no platform, is refused and opens nothing.
+        page_opened || return 0
         printf '%s\n' "Ork Meter: opening its setup page in your browser to connect (first run only; nothing is sent until you approve there). Not now? Close it; /ork-meter:connect works any time."
         return 0
       fi
@@ -158,8 +198,30 @@ json_message() { # <text without quotes or backslashes>
 # Start silently; retain the failure warning, without routine startup notices.
 # The runtime's own lines are not shown, but its not-connected one tells
 # first_run_connect that this configuration is not connected.
+#
+# The origin this computer is configured for (ORK_METER_PLUGIN_ORIGIN in
+# managed or user settings, never a project's: hooks/lib/project_env.py) goes
+# to the runtime, which holds every connection to it. When it cannot be
+# determined (no usable Python) and one was in force, the runtime is told so
+# rather than told there is none: it then sends nothing until this works again.
+origin_args=()
+if configured=$(bash "$root/hooks/py.sh" --script scripts/pairing.py configured-origin 2>/dev/null </dev/null); then
+  [ -z "$configured" ] || origin_args=(--configured-origin "$configured")
+elif [ -e "${CLAUDE_PLUGIN_DATA:-}/configured-origin" ]; then
+  origin_args=(--configured-origin unreadable)
+fi
 status=0
-notice=$(bash "$root/scripts/runtime.sh" --if-installed session-start 2>/dev/null) || status=$?
+notice=$(bash "$root/scripts/runtime.sh" --if-installed session-start ${origin_args[@]+"${origin_args[@]}"} 2>/dev/null) || status=$?
+# One runtime line is shown: the one that says nothing is being sent because
+# of where this computer is configured to connect, or because its Ork Meter
+# Enterprise deployment is not currently attested. The person has to know.
+conflict=
+case "$notice" in
+  '{"systemMessage":"Ork Meter: this computer is connected to '* | \
+  '{"systemMessage":"Ork Meter: the configured destination '* | \
+  '{"systemMessage":"Ork Meter: there is no current deployment attestation '*)
+    conflict=${notice%%$'\n'*} ;;
+esac
 connected=0
 if [ -f "${CLAUDE_PLUGIN_DATA:-}/connection.json" ]; then
   connected=1 # written at connect, removed at disconnect
@@ -174,6 +236,10 @@ else
   json_message "Ork Meter: automatic capture is unavailable."
   exit 0
 fi
-line=$(first_run_connect "$connected" 2>/dev/null) || line=
+if [ -n "$conflict" ]; then
+  printf '%s\n' "$conflict"
+  exit 0
+fi
+line=$(first_run_connect "$connected" "${origin_args[1]:-}" 2>/dev/null) || line=
 [ -z "$line" ] || json_message "$line"
 exit 0

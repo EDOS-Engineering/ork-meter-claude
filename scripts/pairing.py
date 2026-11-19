@@ -48,6 +48,10 @@ import urllib.parse
 import urllib.request
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "hooks/lib"))
+
+import project_env  # noqa: E402
+
 RECORD = "remote-pairing.json"
 SETUP_URL = re.compile(r"http://127\.0\.0\.1:(\d{1,5})/setup/([a-f0-9]{64})")
 CLAIM_PATH = re.compile(r"/plugin/claim/([a-f0-9]{64})")
@@ -230,10 +234,67 @@ def finished(page):
 
 # --- commands ---------------------------------------------------------------
 
+def _windows_system_directories():
+    roots = [os.environ.get(variable) for variable in ("SYSTEMROOT", "WINDIR")]
+    return {os.path.normcase(os.path.normpath(os.path.join(root, sub)))
+            for root in roots if root for sub in ("", "System32", "SysWOW64")}
+
+
+def bash_path():
+    """The absolute path of bash, never a bare name. Started by name, Windows
+    would look in the working directory first, and that is the project's
+    (#404). Only absolute PATH directories are searched. On Windows the
+    system directories are skipped, since their bash.exe is the WSL launcher
+    and not the Git Bash this plugin runs under, and Git's default install
+    directory is tried last."""
+    windows = os.name == "nt"
+    name = "bash.exe" if windows else "bash"
+    skipped = _windows_system_directories() if windows else set()
+    candidates = [os.path.join(entry, name) for entry in os.environ.get("PATH", "").split(os.pathsep)
+                  if entry and os.path.isabs(entry) and os.path.normcase(os.path.normpath(entry)) not in skipped]
+    if windows:
+        candidates.append(os.path.join(os.environ.get("ProgramFiles") or "C:\\Program Files", "Git", "bin", name))
+    else:
+        candidates += ["/bin/bash", "/usr/bin/bash"]
+    for candidate in candidates:
+        if os.path.isabs(candidate) and os.path.isfile(candidate) and (windows or os.access(candidate, os.X_OK)):
+            return candidate
+    raise Failure("unavailable", "bash was not found in an absolute PATH directory; Ork Meter needs it to start its runtime.")
+
+
+def configured_origin():
+    """What ORK_METER_PLUGIN_ORIGIN is set to in managed or user settings
+    (hooks/lib/project_env.py); a project's value is never read."""
+    return project_env.configured_origin(os.environ)
+
+
+def show_configured_origin(args):
+    """For hooks/session-start.sh: the configured origin on one line, or
+    nothing. Not JSON: the value goes straight to the runtime."""
+    value = configured_origin()
+    if value:
+        sys.stdout.write(value + "\n")
+    return 0
+
+
+def destination(environment):
+    """The selector to give the runtime's connect. A configured origin is
+    where a new pairing starts; choosing another environment on the command
+    line is refused here, before the runtime is started."""
+    configured = configured_origin()
+    if not configured:
+        return ["--environment", environment]
+    if environment != "production":
+        raise Failure("origin_conflict", "This computer is configured to connect to %s (ORK_METER_PLUGIN_ORIGIN in "
+                      "managed or user settings), so it cannot connect to the %s environment. "
+                      "Run /ork-meter:connect without choosing an environment." % (configured, environment))
+    return ["--origin", configured]
+
+
 def connect(args):
     data = data_dir(args.plugin_data)
-    command = ["bash", str(ROOT / "scripts/runtime.sh"), "--plugin-data", str(data), "connect",
-               "--environment", args.environment]
+    command = [bash_path(), str(ROOT / "scripts/runtime.sh"), "--plugin-data", str(data), "connect",
+               *destination(args.environment)]
     completed = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True)
     sys.stderr.write(completed.stderr)
     forget(data)   # any earlier terminal setup is replaced by this one
@@ -344,9 +405,11 @@ def main(argv=None):
     two.add_argument("--permitted", choices=("yes",))
     three = commands.add_parser("claim")
     three.add_argument("--code", required=True)
+    commands.add_parser("configured-origin")
     args = parser.parse_args(argv)
     try:
-        return {"connect": connect, "prepare": prepare, "claim": claim}[args.command](args)
+        return {"connect": connect, "prepare": prepare, "claim": claim,
+                "configured-origin": show_configured_origin}[args.command](args)
     except Failure as failure:
         emit({"state": failure.state, "message": failure.message})
         return 1

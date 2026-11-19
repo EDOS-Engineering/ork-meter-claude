@@ -353,7 +353,9 @@ offenders = []
 for d in ("hooks", "hooks/lib", "scripts"):
     for f in sorted(os.listdir(d)):
         p = os.path.join(d, f)
-        if not os.path.isfile(p) or f in ("entitlement.py",) or not (f.endswith(".py") or f.endswith(".sh")):
+        # deployment_attestation.py is vendored byte for byte and only names plus_policy.verify in a docstring
+        # (tests/deployment_attestation_regressions.py pins its digest); it reads no file.
+        if not os.path.isfile(p) or f in ("entitlement.py", "deployment_attestation.py") or not (f.endswith(".py") or f.endswith(".sh")):
             continue
         src = open(p, encoding="utf-8").read()
         for m in re.finditer(r"plus-policy\.json|connection\.json|plus_policy\.verify", src):

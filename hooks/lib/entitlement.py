@@ -38,6 +38,19 @@ The verified envelope's ``policy`` document (``policy``) is the lever
 policy hooks/lib/features.py applies while entitled: which levers are
 available and the tunables' defaults. Metering and capture never read these
 files: usage keeps flowing either way.
+
+Ork Meter Enterprise. A connection whose origin is not a compiled public cell
+(hooks/lib/plugin_origins.py, vendored from ork-meter) is to an enterprise
+deployment. The hooks verify for themselves, on every read, that EDOS vouches
+for exactly that origin now: the runtime keeps the deployment's attestation in
+``$CLAUDE_PLUGIN_DATA/attestations/<host>.json`` and
+hooks/lib/deployment_attestation.py (vendored, the contract is ork-meter
+docs/deployment-attestation.md) verifies it against the compiled root keys.
+The envelope then verifies only with the policy keys that attestation names,
+each bound to that origin. No compiled key signs for an enterprise origin, and
+there is no unsigned legacy answer for one. Without a current attestation the
+connection is not entitled. Entitlement there comes from the organization, so
+nothing shown for it mentions Plus or billing.
 """
 
 import calendar
@@ -46,12 +59,15 @@ import json
 import os
 import time
 
+import deployment_attestation
+import plugin_origins
 import plus_policy
 import session
 
 FILE_NAME = "entitlement.json"
 POLICY_FILE = "plus-policy.json"
 CONNECTION_FILE = "connection.json"
+ATTESTATION_DIR = "attestations"
 PLUGIN = "claude-code"
 MAX_BYTES = 1024
 CONNECTION_MAX_BYTES = 1024
@@ -68,6 +84,10 @@ NOT_CONNECTED = "not_connected"
 
 MESSAGE = ("Ork Meter savings are off: they are part of Ork Meter Plus. "
            "Upgrade at https://orkmeter.com/billing")
+# Ork Meter Enterprise: entitlement comes from the organization. Never Plus,
+# purchasing or a billing address.
+ENTERPRISE_MESSAGE = ("Ork Meter savings are off: your organization has not turned them on for this account, "
+                      "or its Ork Meter Enterprise deployment could not be verified. Ask your administrator.")
 
 
 def data_dir(env):
@@ -129,7 +149,8 @@ def read(file_path):
 def read_connection(file_path):
     """``(reference, origin)`` from ``connection.json``: exactly those two
     keys, a non-empty printable reference and an ``https`` origin with no
-    path, or raise."""
+    path, or raise. Whether the origin may be trusted is decided by
+    ``policy_keys``, not here."""
     value = json.loads(_private(file_path, CONNECTION_MAX_BYTES, "connection"), object_pairs_hook=_unique)
     if not isinstance(value, dict) or set(value) != {"reference", "origin"}:
         raise ValueError("connection fields")
@@ -143,14 +164,64 @@ def read_connection(file_path):
     return reference, origin
 
 
+def enterprise(origin):
+    """Whether ``origin`` is an Ork Meter Enterprise deployment: any origin
+    that is neither a compiled public cell nor the issuer of a compiled
+    policy key (the contract's test origin). Only an attestation admits it."""
+    if plugin_origins.allowed(origin):
+        return False
+    return not any(issuer == origin for _, issuer in plus_policy.PUBLIC_KEYS.values())
+
+
+def attestation(directory, origin, now):
+    """The verified deployment attestation for exactly ``origin`` from the
+    file the runtime keeps for it, or raise. Nothing is fetched here."""
+    if not plugin_origins.canonical(origin):
+        raise ValueError("connection origin")
+    host = origin[len("https://"):]
+    raw = _private(os.path.join(directory, ATTESTATION_DIR, host + ".json"),
+                   deployment_attestation.MAX_ENVELOPE_BYTES, "deployment attestation")
+    return deployment_attestation.verify(raw, origin, now)
+
+
+def policy_keys(directory, origin, now):
+    """The only keys that may sign this connection's lever policy: None (the
+    compiled table, each key bound to its own cell) for a public cell, and
+    for an enterprise deployment the keys its attestation names, or raise
+    when EDOS does not vouch for that origin now."""
+    if not enterprise(origin):
+        return None
+    return attestation(directory, origin, now)["policy_keys"]
+
+
 def verify(env, now):
     """The verified envelope (``plus_policy.verify``) for this pairing, or raise."""
     directory = data_dir(env)
     if directory is None:
         raise ValueError("no plugin data directory")
     reference, origin = read_connection(os.path.join(directory, CONNECTION_FILE))
+    keys = policy_keys(directory, origin, now)
     raw = _private(os.path.join(directory, POLICY_FILE), plus_policy.MAX_ENVELOPE_BYTES, "policy envelope")
-    return plus_policy.verify(raw, PLUGIN, reference, origin, now)
+    return plus_policy.verify(raw, PLUGIN, reference, origin, now, keys=keys)
+
+
+def connected_to_enterprise(env):
+    """Whether the saved connection is to an Ork Meter Enterprise deployment,
+    for wording only. Never raises; an unreadable connection is not one."""
+    try:
+        directory = data_dir(env)
+        if directory is None:
+            return False
+        return enterprise(read_connection(os.path.join(directory, CONNECTION_FILE))[1])
+    except (OSError, ValueError, TypeError, KeyError, RecursionError):
+        return False
+
+
+def message(env):
+    """What to tell the person when the levers are off for lack of
+    entitlement: the Plus line, or for an enterprise connection a line that
+    names neither Plus nor billing."""
+    return ENTERPRISE_MESSAGE if connected_to_enterprise(env) else MESSAGE
 
 
 def _current(answer, now):
@@ -175,7 +246,8 @@ def resolve(env, now=None):
             return state, verified["policy"]
         legacy = os.path.join(directory, FILE_NAME)
         if os.path.lexists(legacy):
-            if now >= LEGACY_UNTIL:
+            if now >= LEGACY_UNTIL or connected_to_enterprise(env):
+                # An enterprise deployment never had unsigned answers.
                 return NOT_ENTITLED, None
             return (ENTITLED if _current(read(legacy), now) else NOT_ENTITLED), None
         return NOT_CONNECTED, None

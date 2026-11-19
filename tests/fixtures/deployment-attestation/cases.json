@@ -1,0 +1,560 @@
+{
+  "cases": [
+    {
+      "name": "valid",
+      "file": "valid.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": true
+    },
+    {
+      "name": "valid-two-keys",
+      "file": "valid-two-keys.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": true
+    },
+    {
+      "name": "valid",
+      "file": "valid.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2027-02-11T00:00:00Z",
+      "ok": false,
+      "reason": "expired"
+    },
+    {
+      "name": "valid",
+      "file": "valid.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2027-02-10T23:59:59Z",
+      "ok": true
+    },
+    {
+      "name": "valid",
+      "file": "valid.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2026-11-12T23:54:59Z",
+      "ok": false,
+      "reason": "not yet valid"
+    },
+    {
+      "name": "valid",
+      "file": "valid.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2026-11-12T23:55:00Z",
+      "ok": true
+    },
+    {
+      "name": "valid",
+      "file": "valid.json",
+      "origin": "https://other.attestation-test.invalid",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "origin"
+    },
+    {
+      "name": "valid",
+      "file": "valid.json",
+      "origin": "https://ome.attestation-test.invalid/",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "destination"
+    },
+    {
+      "name": "valid",
+      "file": "valid.json",
+      "origin": "http://ome.attestation-test.invalid",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "destination"
+    },
+    {
+      "name": "valid",
+      "file": "valid.json",
+      "origin": "https://127.0.0.1",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "destination"
+    },
+    {
+      "name": "valid",
+      "file": "valid.json",
+      "origin": "https://localhost",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "destination"
+    },
+    {
+      "name": "ip-address",
+      "file": "ip-address.json",
+      "origin": "https://203.0.113.7",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "destination"
+    },
+    {
+      "name": "valid",
+      "file": "valid.json",
+      "origin": "https://orkmeter.com",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "compiled origin"
+    },
+    {
+      "name": "public-cell",
+      "file": "public-cell.json",
+      "origin": "https://orkmeter.com",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "compiled origin"
+    },
+    {
+      "name": "staging-cell",
+      "file": "staging-cell.json",
+      "origin": "https://ork-meter.edos.io",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "compiled origin"
+    },
+    {
+      "name": "wrong-root",
+      "file": "wrong-root.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "signature"
+    },
+    {
+      "name": "unknown-root",
+      "file": "unknown-root.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "unknown root"
+    },
+    {
+      "name": "tampered",
+      "file": "tampered.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "signature"
+    },
+    {
+      "name": "padded-base64",
+      "file": "padded-base64.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "payload size"
+    },
+    {
+      "name": "long-lifetime",
+      "file": "long-lifetime.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "lifetime"
+    },
+    {
+      "name": "a-year",
+      "file": "a-year.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "lifetime"
+    },
+    {
+      "name": "ends-before-it-starts",
+      "file": "ends-before-it-starts.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "lifetime"
+    },
+    {
+      "name": "no-keys",
+      "file": "no-keys.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "policy keys"
+    },
+    {
+      "name": "three-keys",
+      "file": "three-keys.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "policy keys"
+    },
+    {
+      "name": "repeated-key-id",
+      "file": "repeated-key-id.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "policy keys"
+    },
+    {
+      "name": "compiled-key-name",
+      "file": "compiled-key-name.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "policy keys"
+    },
+    {
+      "name": "test-key-name",
+      "file": "test-key-name.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "policy keys"
+    },
+    {
+      "name": "upper-case-public",
+      "file": "upper-case-public.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "policy keys"
+    },
+    {
+      "name": "short-public",
+      "file": "short-public.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "policy keys"
+    },
+    {
+      "name": "key-extra-field",
+      "file": "key-extra-field.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "policy keys"
+    },
+    {
+      "name": "kind-public",
+      "file": "kind-public.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "kind"
+    },
+    {
+      "name": "empty-organization",
+      "file": "empty-organization.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "organization"
+    },
+    {
+      "name": "control-in-organization",
+      "file": "control-in-organization.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "organization"
+    },
+    {
+      "name": "unknown-field",
+      "file": "unknown-field.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "payload fields"
+    },
+    {
+      "name": "repeated-field",
+      "file": "repeated-field.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "payload fields"
+    },
+    {
+      "name": "version-2",
+      "file": "version-2.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "payload version"
+    },
+    {
+      "name": "version-string",
+      "file": "version-string.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "payload version"
+    },
+    {
+      "name": "version-float",
+      "file": "version-float.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "payload version"
+    },
+    {
+      "name": "payload-origin-with-slash",
+      "file": "payload-origin-with-slash.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "origin"
+    },
+    {
+      "name": "offset-timestamp",
+      "file": "offset-timestamp.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "issued_at"
+    },
+    {
+      "name": "extra-envelope-field",
+      "file": "extra-envelope-field.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "envelope fields"
+    },
+    {
+      "name": "not-json",
+      "file": "not-json.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "envelope fields"
+    },
+    {
+      "name": "escaped-newline-in-payload",
+      "file": "escaped-newline-in-payload.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "payload size"
+    },
+    {
+      "name": "escaped-cr-in-signature",
+      "file": "escaped-cr-in-signature.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "signature size"
+    },
+    {
+      "name": "bom-envelope",
+      "file": "bom-envelope.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "envelope fields"
+    },
+    {
+      "name": "utf16-envelope",
+      "file": "utf16-envelope.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "envelope fields"
+    },
+    {
+      "name": "bom-payload",
+      "file": "bom-payload.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "payload fields"
+    },
+    {
+      "name": "utf16-payload",
+      "file": "utf16-payload.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "payload fields"
+    },
+    {
+      "name": "surrogate-escape-in-organization",
+      "file": "surrogate-escape-in-organization.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "organization"
+    },
+    {
+      "name": "invalid-utf8-in-organization",
+      "file": "invalid-utf8-in-organization.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "payload fields"
+    },
+    {
+      "name": "replacement-character-in-organization",
+      "file": "replacement-character-in-organization.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "organization"
+    },
+    {
+      "name": "organization-latin-greek-cyrillic",
+      "file": "organization-latin-greek-cyrillic.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": true
+    },
+    {
+      "name": "organization-cjk",
+      "file": "organization-cjk.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": true
+    },
+    {
+      "name": "organization-recent-unicode",
+      "file": "organization-recent-unicode.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "organization"
+    },
+    {
+      "name": "organization-combining-marks-only",
+      "file": "organization-combining-marks-only.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "organization"
+    },
+    {
+      "name": "organization-decomposed-accent",
+      "file": "organization-decomposed-accent.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "organization"
+    },
+    {
+      "name": "organization-no-break-space",
+      "file": "organization-no-break-space.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "organization"
+    },
+    {
+      "name": "organization-right-to-left",
+      "file": "organization-right-to-left.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "organization"
+    },
+    {
+      "name": "organization-unassigned",
+      "file": "organization-unassigned.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "organization"
+    },
+    {
+      "name": "organization-private-use",
+      "file": "organization-private-use.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "organization"
+    },
+    {
+      "name": "organization-punctuation-only",
+      "file": "organization-punctuation-only.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "organization"
+    },
+    {
+      "name": "organization-trailing-space",
+      "file": "organization-trailing-space.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "organization"
+    },
+    {
+      "name": "null-key-id",
+      "file": "null-key-id.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "envelope fields"
+    },
+    {
+      "name": "comma-fraction-timestamp",
+      "file": "comma-fraction-timestamp.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "issued_at"
+    },
+    {
+      "name": "arabic-indic-digits-timestamp",
+      "file": "arabic-indic-digits-timestamp.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "issued_at"
+    },
+    {
+      "name": "lower-case-z-timestamp",
+      "file": "lower-case-z-timestamp.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "issued_at"
+    },
+    {
+      "name": "ninety-days-and-a-nanosecond",
+      "file": "ninety-days-and-a-nanosecond.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "lifetime"
+    },
+    {
+      "name": "nan-version",
+      "file": "nan-version.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "payload fields"
+    },
+    {
+      "name": "payload-over-4096",
+      "file": "payload-over-4096.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "payload size"
+    },
+    {
+      "name": "oversized",
+      "file": "oversized.json",
+      "origin": "https://ome.attestation-test.invalid",
+      "now": "2026-11-14T00:00:00Z",
+      "ok": false,
+      "reason": "envelope size"
+    }
+  ],
+  "root_key_id": "edos-deployment-test-2026",
+  "root_public": "d29fa1e9c90a7f29cd9b80ea1432d2a06f752606e2bea751b0bc91a502f29c5e"
+}

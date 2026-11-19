@@ -23,6 +23,26 @@ bash "${CLAUDE_PLUGIN_ROOT}/hooks/py.sh" --script scripts/pairing.py connect --e
 For other arguments, explain that only `dev` or no arguments are supported.
 Never interpolate arbitrary arguments into a shell command.
 
+## Where it connects
+
+The answer's `message` names the destination; always show it to the person.
+With no arguments that is Ork Meter (`https://orkmeter.com`), unless this
+computer is configured for an Ork Meter Enterprise deployment: an
+administrator (managed settings) or the person (user settings) set
+`ORK_METER_PLUGIN_ORIGIN`, and the same command then connects there. The
+message names that origin and the organization EDOS attested for it. A
+project's settings can never choose the destination, and there is no argument
+for one: never pass an origin on the command line.
+
+`origin_conflict`: this computer is configured for another destination than
+the one asked for, or than the one it is connected to. Report the `message`
+as given; it says what to run. Do not suggest changing or removing the
+setting to get past it.
+
+If the command reports that the destination presented no deployment
+attestation signed by EDOS, nothing was sent. Tell the person to check the
+address with their administrator; do not retry with another destination.
+
 ## In a browser on this computer
 
 `setup_opened`: the command opened a local setup page. The person selects

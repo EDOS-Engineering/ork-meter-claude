@@ -437,5 +437,99 @@ class ProjectSettingsOffOnly(unittest.TestCase):
                          (features.RETENTION_DEFAULT_DAYS, features.RETENTION_MAX_DAYS, features.RETENTION_ENV))
 
 
+
+class ConfiguredOrigin(unittest.TestCase):
+    """ORK_METER_PLUGIN_ORIGIN comes from managed or user settings only. A
+    repository can neither choose where usage is sent nor lift that choice."""
+    ORIGIN = "https://ome.example-customer.com"
+
+    def setUp(self):
+        project_env._cache.clear()
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.repo = self.root / "repo"
+        (self.repo / ".claude").mkdir(parents=True)
+        (self.repo / ".git").mkdir()
+        self.home = self.root / "home"
+        (self.home / ".claude").mkdir(parents=True)
+        self.env = {"HOME": str(self.home), "CLAUDE_PROJECT_DIR": str(self.repo)}
+        self.payload = {"cwd": str(self.repo)}
+        for name, value in (("MANAGED_FILES", (str(self.root / "managed" / "managed-settings.json"),)),
+                            ("_real_home", lambda: str(self.home))):
+            patcher = patch.object(project_env, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def write(self, path, env=None, raw=None):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(raw if raw is not None else json.dumps({"env": env}), encoding="utf-8")
+
+    def configured(self, live=None):
+        project_env._cache.clear()
+        return project_env.configured_origin(dict(self.env, **(live or {})), self.payload)
+
+    def test_nothing_configured(self):
+        self.assertIsNone(self.configured())
+
+    def test_user_settings_name_it(self):
+        self.write(self.home / ".claude" / "settings.json", {project_env.ORIGIN: self.ORIGIN})
+        self.assertEqual(self.configured(), self.ORIGIN)
+
+    def test_managed_settings_win_and_the_last_drop_in_wins_among_them(self):
+        self.write(self.home / ".claude" / "settings.json", {project_env.ORIGIN: "https://user.example.com"})
+        self.write(self.root / "managed" / "managed-settings.json", {project_env.ORIGIN: self.ORIGIN})
+        self.assertEqual(self.configured(), self.ORIGIN)
+        self.write(self.root / "managed" / "managed-settings.d" / "20-ork.json", {project_env.ORIGIN: "https://later.example.com"})
+        self.assertEqual(self.configured(), "https://later.example.com")
+
+    def test_a_project_can_neither_set_it_nor_lift_it(self):
+        planted = "https://attacker.example.com"
+        for name in project_env.PROJECT_FILES:
+            self.write(self.repo / ".claude" / name, {project_env.ORIGIN: planted})
+        # Claude Code merges the project's env block into the process environment.
+        self.assertIsNone(self.configured({project_env.ORIGIN: planted}), "a project's value is never used")
+        self.write(self.home / ".claude" / "settings.json", {project_env.ORIGIN: self.ORIGIN})
+        self.assertEqual(self.configured({project_env.ORIGIN: planted}), self.ORIGIN)
+        self.assertEqual(self.configured({project_env.ORIGIN: ""}), self.ORIGIN, "nor can it clear the person's")
+
+    def test_the_process_environment_alone_configures_nothing(self):
+        self.assertIsNone(self.configured({project_env.ORIGIN: self.ORIGIN}))
+
+    def test_a_project_cannot_point_the_home_directory_at_its_own_settings(self):
+        fake = self.repo / "home"
+        self.write(fake / ".claude" / "settings.json", {project_env.ORIGIN: "https://attacker.example.com"})
+        self.write(self.repo / ".claude" / "settings.json", {"HOME": str(fake), "CLAUDE_CONFIG_DIR": str(fake / ".claude")})
+        live = {"HOME": str(fake), "CLAUDE_CONFIG_DIR": str(fake / ".claude")}
+        self.assertIsNone(self.configured(live))
+        self.write(self.home / ".claude" / "settings.json", {project_env.ORIGIN: self.ORIGIN})
+        self.assertEqual(self.configured(live), self.ORIGIN, "the account's real settings still count")
+
+    def test_a_managed_rule_that_cannot_be_read_is_not_a_rule_that_was_lifted(self):
+        self.write(self.home / ".claude" / "settings.json", {project_env.ORIGIN: self.ORIGIN})
+        self.write(self.root / "managed" / "managed-settings.json", raw="{not json")
+        self.assertEqual(self.configured(), project_env.ORIGIN_UNREADABLE)
+        for value in ({"nested": 1}, ["a"], None, ""):
+            with self.subTest(value=value):
+                self.write(self.root / "managed" / "managed-settings.json", {project_env.ORIGIN: value})
+                self.assertEqual(self.configured(), project_env.ORIGIN_UNREADABLE)
+        # A number or boolean is text to Claude Code; it is passed on, and the runtime refuses it.
+        for value, text in ((7, "7"), (True, "true")):
+            self.write(self.root / "managed" / "managed-settings.json", {project_env.ORIGIN: value})
+            self.assertEqual(self.configured(), text)
+
+    def test_the_persons_own_unreadable_settings_name_nothing(self):
+        self.write(self.home / ".claude" / "settings.json", raw="{not json")
+        self.assertIsNone(self.configured())
+        self.write(self.home / ".claude" / "settings.json", {project_env.ORIGIN: ["a"]})
+        self.assertEqual(self.configured(), project_env.ORIGIN_UNREADABLE, "but a value there that is not text is not ignored")
+
+    def test_the_value_is_passed_on_as_written(self):
+        # What an acceptable origin is, the runtime decides (session-start --configured-origin).
+        for value in ("https://127.0.0.1", "http://ome.example.com", "ome.example.com", "https://ome.example.com/path"):
+            self.write(self.home / ".claude" / "settings.json", {project_env.ORIGIN: value})
+            self.assertEqual(self.configured(), value)
+
+
 if __name__ == "__main__":
     unittest.main()
