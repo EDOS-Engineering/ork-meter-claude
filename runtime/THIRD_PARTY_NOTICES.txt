@@ -2,8 +2,8 @@ Third-party notices for the Ork Meter plugin runtime
 (runtime/<os>-<arch>/ork-meter-plugin-runtime, .exe on Windows).
 
 The runtime is cmd/claude-plugin-runtime of EDOS-Engineering/ork-meter at
-abf75c4782707f8e45341b012f2879741f79f008,
-built with CGO_ENABLED=0 and go1.26.10. It statically links the
+56fd3c29fe5ef61f0851280eedda98f81077b137,
+built with CGO_ENABLED=0 and go1.26.11. It statically links the
 Go standard library and the 13 Go module(s) below, listed by
 `go list -deps` for each target with that toolchain. Each is licensed under
 the terms reproduced here.
